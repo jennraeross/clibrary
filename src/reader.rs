@@ -14,6 +14,7 @@ use crate::epub::{
 };
 use crate::model::ReadingProgress;
 use crate::util;
+use crate::wrap;
 
 const MAX_COLUMN_WIDTH: u16 = 76;
 const MIN_COLUMN_WIDTH: u16 = 48;
@@ -75,6 +76,8 @@ pub struct Reader {
     toc_open: bool,
     toc_selection: usize,
     help_open: bool,
+    metadata_open: bool,
+    metadata_scroll: usize,
 }
 
 impl Reader {
@@ -115,6 +118,8 @@ impl Reader {
             toc_open: false,
             toc_selection: 0,
             help_open: false,
+            metadata_open: false,
+            metadata_scroll: 0,
         })
     }
 
@@ -132,6 +137,27 @@ impl Reader {
 
         if self.toc_open {
             return self.handle_toc_key(key);
+        }
+
+        if self.metadata_open {
+            let visible = self.metadata_visible();
+            match key.code {
+                KeyCode::Char('m') | KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {
+                    self.metadata_open = false;
+                }
+                KeyCode::Char('j') | KeyCode::Down => self.scroll_metadata(1),
+                KeyCode::Char('k') | KeyCode::Up => self.scroll_metadata(-1),
+                KeyCode::PageDown | KeyCode::Char(' ') => {
+                    self.scroll_metadata(visible as isize);
+                }
+                KeyCode::PageUp => self.scroll_metadata(-(visible as isize)),
+                KeyCode::Char('g') | KeyCode::Home => self.metadata_scroll = 0,
+                KeyCode::Char('G') | KeyCode::End => {
+                    self.metadata_scroll = self.metadata_max_scroll();
+                }
+                _ => {}
+            }
+            return ReaderAction::None;
         }
 
         match key.code {
@@ -159,7 +185,11 @@ impl Reader {
             }
             KeyCode::Char(']') => self.next_chapter(),
             KeyCode::Char('[') => self.previous_chapter(),
-            KeyCode::Char('t') => self.open_toc(),
+            KeyCode::Char('t') | KeyCode::Tab => self.open_toc(),
+            KeyCode::Char('m') => {
+                self.metadata_open = true;
+                self.metadata_scroll = 0;
+            }
             KeyCode::Char('c') => {
                 self.mode = self.mode.next();
                 self.relayout(self.screen);
@@ -178,7 +208,7 @@ impl Reader {
     fn handle_toc_key(&mut self, key: KeyEvent) -> ReaderAction {
         let visible = self.toc_visible();
         match key.code {
-            KeyCode::Esc | KeyCode::Char('t') | KeyCode::Char('q') => {
+            KeyCode::Esc | KeyCode::Char('t') | KeyCode::Char('q') | KeyCode::Tab => {
                 self.toc_open = false;
             }
             KeyCode::Char('j') | KeyCode::Down => {
@@ -362,13 +392,16 @@ impl Reader {
         if self.help_open {
             draw_help(frame, area);
         }
+        if self.metadata_open {
+            self.draw_metadata(frame, area);
+        }
     }
 
     fn draw_header(&self, frame: &mut Frame, area: Rect) {
         if area.height == 0 {
             return;
         }
-        let book = self.book.title.as_deref().unwrap_or("Untitled");
+        let book = self.book.meta.title.as_deref().unwrap_or("Untitled");
         let chapter = self
             .book
             .chapters
@@ -439,7 +472,7 @@ impl Reader {
             return;
         }
         let line = Line::from(Span::styled(
-            " j/k page · PgDn/PgUp · [ ] chapter · t contents · c columns · +/- width · ? help · q back",
+            " j/k page · PgDn/PgUp · [ ] chapter · t/Tab contents · m metadata · c columns · +/- width · ? help · q back",
             Style::default().fg(Color::DarkGray),
         ));
         frame.render_widget(Paragraph::new(line), area);
@@ -482,6 +515,133 @@ impl Reader {
                 .title(" Contents ")
                 .border_style(Style::default().fg(Color::Cyan)),
         );
+        frame.render_widget(paragraph, popup);
+    }
+
+    fn metadata_lines(&self) -> Vec<Line<'static>> {
+        let meta = &self.book.meta;
+        let mut lines = vec![
+            Line::from(Span::styled(
+                meta.title.as_deref().unwrap_or("Untitled").to_string(),
+                Style::default()
+                    .fg(Color::LightCyan)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(vec![
+                Span::styled("by ", Style::default().fg(Color::DarkGray)),
+                Span::raw(if meta.authors.is_empty() {
+                    "Unknown author".to_string()
+                } else {
+                    meta.authors.join(", ")
+                }),
+            ]),
+        ];
+
+        let mut details = false;
+        if let Some(series) = &meta.series {
+            let value = match meta.series_index {
+                Some(index) => format!("{series} #{index}"),
+                None => series.clone(),
+            };
+            lines.push(metadata_line("Series", &value));
+            details = true;
+        }
+        if let Some(published) = &meta.published {
+            lines.push(metadata_line("Published", published));
+            details = true;
+        }
+        if let Some(publisher) = &meta.publisher {
+            lines.push(metadata_line("Publisher", publisher));
+            details = true;
+        }
+        if let Some(language) = &meta.language {
+            lines.push(metadata_line("Language", language));
+            details = true;
+        }
+        if !meta.subjects.is_empty() {
+            lines.push(metadata_line("Subjects", &meta.subjects.join(", ")));
+            details = true;
+        }
+        if !meta.identifiers.is_empty() {
+            let value = meta
+                .identifiers
+                .iter()
+                .map(|identifier| match &identifier.scheme {
+                    Some(scheme) => format!("{scheme}: {}", identifier.value),
+                    None => identifier.value.clone(),
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            lines.push(metadata_line("Identifiers", &value));
+            details = true;
+        }
+
+        if let Some(description) = meta
+            .description
+            .as_deref()
+            .map(str::trim)
+            .filter(|description| !description.is_empty())
+        {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                util::truncate_chars(description, 4000),
+                Style::default().fg(Color::Gray),
+            )));
+            details = true;
+        }
+
+        if !details {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "No further metadata available.",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+
+        lines
+    }
+
+    fn metadata_visible(&self) -> usize {
+        metadata_popup(self.screen).height.saturating_sub(2) as usize
+    }
+
+    fn metadata_max_scroll(&self) -> usize {
+        let popup = metadata_popup(self.screen);
+        let wrapped = wrap::wrap_lines(
+            &self.metadata_lines(),
+            popup.width.saturating_sub(2) as usize,
+        );
+        wrapped
+            .len()
+            .saturating_sub(popup.height.saturating_sub(2) as usize)
+    }
+
+    fn scroll_metadata(&mut self, delta: isize) {
+        let max = self.metadata_max_scroll();
+        self.metadata_scroll = self.metadata_scroll.saturating_add_signed(delta).min(max);
+    }
+
+    fn draw_metadata(&mut self, frame: &mut Frame, area: Rect) {
+        let popup = metadata_popup(area);
+        frame.render_widget(Clear, popup);
+
+        let wrapped = wrap::wrap_lines(
+            &self.metadata_lines(),
+            popup.width.saturating_sub(2) as usize,
+        );
+        let max = wrapped
+            .len()
+            .saturating_sub(popup.height.saturating_sub(2) as usize);
+        self.metadata_scroll = self.metadata_scroll.min(max);
+
+        let paragraph = Paragraph::new(Text::from(wrapped))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Metadata ")
+                    .border_style(Style::default().fg(Color::Cyan)),
+            )
+            .scroll((self.metadata_scroll as u16, 0));
         frame.render_widget(paragraph, popup);
     }
 
@@ -607,7 +767,8 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         help_line("g / Home", "start of chapter"),
         help_line("G / End", "end of chapter"),
         help_line("] / [", "next / previous chapter"),
-        help_line("t", "table of contents"),
+        help_line("t / Tab", "table of contents"),
+        help_line("m", "book metadata (j/k scroll)"),
         help_line("c", "columns: auto → one → two"),
         help_line("+ / -", "wider / narrower columns"),
         help_line("0", "reset column width"),
@@ -633,11 +794,24 @@ fn draw_help(frame: &mut Frame, area: Rect) {
     frame.render_widget(help, popup);
 }
 
+fn metadata_line(label: &str, value: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{label:<12}"), Style::default().fg(Color::DarkGray)),
+        Span::raw(value.to_string()),
+    ])
+}
+
 fn help_line(key: &str, description: &str) -> Line<'static> {
     Line::from(vec![
         Span::styled(format!("  {key:<17}"), Style::default().fg(Color::Yellow)),
         Span::raw(description.to_string()),
     ])
+}
+
+fn metadata_popup(area: Rect) -> Rect {
+    let width = area.width.saturating_sub(8).clamp(40, 78);
+    let height = area.height.saturating_sub(4).clamp(7, 30);
+    centered_rect(area, width, height)
 }
 
 fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
@@ -973,7 +1147,7 @@ fn text_width(text: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::epub::{Block as BookBlock, Chapter, InlineSpan, InlineStyle, TocEntry};
+    use crate::epub::{Block as BookBlock, Chapter, EpubMeta, InlineSpan, InlineStyle, TocEntry};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     fn paragraph(text: &str) -> BookBlock {
@@ -1008,8 +1182,22 @@ mod tests {
             paragraph("The second chapter begins here."),
         ];
         EpubBook {
-            title: Some("A Test Book".to_string()),
-            authors: vec!["Test Author".to_string()],
+            meta: EpubMeta {
+                title: Some("A Test Book".to_string()),
+                authors: vec!["Test Author".to_string()],
+                series: Some("Test Series".to_string()),
+                series_index: Some(2.0),
+                publisher: Some("Test Press".to_string()),
+                published: Some("2001".to_string()),
+                language: Some("en".to_string()),
+                description: Some("A test book used to exercise reader metadata.".to_string()),
+                subjects: vec!["Science Fiction".to_string()],
+                identifiers: vec![crate::model::Identifier {
+                    scheme: Some("ISBN".to_string()),
+                    value: "9780000000000".to_string(),
+                }],
+                ..EpubMeta::default()
+            },
             chapters: vec![
                 Chapter {
                     title: Some("Chapter One".to_string()),
@@ -1307,6 +1495,95 @@ mod tests {
         reader.set_screen(Rect::new(0, 0, 80, 24));
         reader.relayout(Rect::new(0, 0, 80, 24));
         assert_eq!(reader.chapter(), 1);
+    }
+
+    #[test]
+    fn tab_toggles_the_table_of_contents() {
+        let mut reader = Reader::from_book(sample_book()).unwrap();
+        let screen = render(&mut reader, 120, 30);
+        assert!(!screen.contains("Contents"));
+
+        press(&mut reader, KeyCode::Tab);
+        let screen = render(&mut reader, 120, 30);
+        assert!(screen.contains("Contents"));
+
+        press(&mut reader, KeyCode::Tab);
+        let screen = render(&mut reader, 120, 30);
+        assert!(!screen.contains("Contents"));
+
+        // Tab opens the contents from any page, and Enter jumps to the entry.
+        press(&mut reader, KeyCode::Tab);
+        press(&mut reader, KeyCode::Char('j'));
+        press(&mut reader, KeyCode::Enter);
+        assert_eq!(reader.chapter(), 1);
+    }
+
+    #[test]
+    fn m_opens_and_closes_book_metadata() {
+        let mut reader = Reader::from_book(sample_book()).unwrap();
+        let screen = render(&mut reader, 120, 30);
+        assert!(!screen.contains("Metadata"));
+
+        press(&mut reader, KeyCode::Char('m'));
+        let screen = render(&mut reader, 120, 30);
+        assert!(screen.contains("Metadata"));
+        assert!(screen.contains("Test Press"));
+        assert!(screen.contains("Test Series #2"));
+        assert!(screen.contains("9780000000000"));
+
+        press(&mut reader, KeyCode::Char('m'));
+        assert!(!render(&mut reader, 120, 30).contains("Metadata"));
+
+        press(&mut reader, KeyCode::Char('m'));
+        press(&mut reader, KeyCode::Esc);
+        assert!(!render(&mut reader, 120, 30).contains("Metadata"));
+
+        press(&mut reader, KeyCode::Char('m'));
+        assert_eq!(
+            reader.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
+            ReaderAction::None
+        );
+        assert!(!render(&mut reader, 120, 30).contains("Metadata"));
+
+        press(&mut reader, KeyCode::Char('m'));
+        assert_eq!(
+            reader.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            ReaderAction::Close
+        );
+    }
+
+    #[test]
+    fn metadata_pane_scrolls() {
+        let mut book = sample_book();
+        book.meta.description = Some("word ".repeat(400));
+        let mut reader = Reader::from_book(book).unwrap();
+
+        let screen = render(&mut reader, 120, 30);
+        assert!(!screen.contains("Metadata"));
+
+        press(&mut reader, KeyCode::Char('m'));
+        let top = render(&mut reader, 120, 30);
+        assert!(top.contains("Metadata"));
+        assert_eq!(reader.metadata_scroll, 0);
+
+        press(&mut reader, KeyCode::Char('j'));
+        let scrolled = render(&mut reader, 120, 30);
+        assert!(reader.metadata_scroll > 0);
+        assert_ne!(top, scrolled);
+
+        press(&mut reader, KeyCode::PageDown);
+        render(&mut reader, 120, 30);
+        assert!(reader.metadata_scroll > 1);
+
+        press(&mut reader, KeyCode::Char('G'));
+        render(&mut reader, 120, 30);
+        assert!(reader.metadata_scroll > 1);
+        press(&mut reader, KeyCode::Char('g'));
+        render(&mut reader, 120, 30);
+        assert_eq!(reader.metadata_scroll, 0);
+
+        press(&mut reader, KeyCode::Char('m'));
+        assert!(!render(&mut reader, 120, 30).contains("Metadata"));
     }
 
     #[test]

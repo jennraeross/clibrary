@@ -122,6 +122,7 @@ Add JSON output includes a `status` of `added`, `duplicate`, `would-add`, or
 | `j` / `↓`, `k` / `↑` | Next / previous book |
 | `g` / `Home`, `G` / `End` | First / last book |
 | `PgDn` / `PgUp` | Move ten books |
+| `Tab` | Focus the Details pane (`j`/`k`, `PgDn`/`PgUp`, `g`/`G` scroll; `Tab`/`Esc` back) |
 | `/` | Search (live filter; `Enter` applies, `Esc` cancels) |
 | `Esc` | Clear the active filter, or quit when there is no filter |
 | `s` | Cycle sort: author → title → series → published → added |
@@ -164,7 +165,8 @@ the previous one.
 | `g` / `Home` | Start of chapter |
 | `G` / `End` | End of chapter |
 | `]` / `[` | Next / previous chapter |
-| `t` | Table of contents |
+| `t` / `Tab` | Table of contents |
+| `m` | Book metadata |
 | `c` | Cycle columns: auto → one → two |
 | `+` / `-` | Wider / narrower columns |
 | `0` | Reset column width |
@@ -175,6 +177,10 @@ The table of contents uses EPUB 3 navigation documents when available and
 falls back to EPUB 2 NCX, then to chapter headings. Headings, paragraphs,
 blockquotes, lists, preformatted text, and inline emphasis are preserved; images
 are skipped. EPUBs whose content is encrypted (DRM) cannot be read this way.
+
+The `m` metadata popup and the browser's Details pane scroll with `j`/`k`,
+`PgDn`/`PgUp`, and `g`/`G`. Close the metadata popup with `m`, `Esc`, `q`, or
+`Enter`.
 
 ## Library layout
 

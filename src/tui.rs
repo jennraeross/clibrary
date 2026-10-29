@@ -20,8 +20,10 @@ use crate::library::Library;
 use crate::model::{Book, SortKey, sorted_indices};
 use crate::reader::{Reader, ReaderAction};
 use crate::util;
+use crate::wrap;
 
 const PAGE_SIZE: usize = 10;
+const DETAILS_PAGE_LINES: usize = 5;
 
 pub fn run(library: Library, sort: SortKey, reverse: bool) -> Result<()> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
@@ -104,6 +106,8 @@ struct App {
     quit: bool,
     reader: Option<Reader>,
     reader_book: Option<String>,
+    details_scroll: usize,
+    details_focus: bool,
 }
 
 impl App {
@@ -123,6 +127,8 @@ impl App {
             quit: false,
             reader: None,
             reader_book: None,
+            details_scroll: 0,
+            details_focus: false,
         };
         app.refresh_missing();
         app.rebuild();
@@ -182,6 +188,10 @@ impl App {
                 }
             });
         self.table_state.select(selection);
+        if self.entries.is_empty() {
+            self.details_focus = false;
+        }
+        self.details_scroll = 0;
     }
 
     fn selected_book(&self) -> Option<&Book> {
@@ -217,7 +227,14 @@ impl App {
         }
         let current = self.table_state.selected().unwrap_or(0) as isize;
         let next = (current + delta).clamp(0, self.entries.len() as isize - 1);
+        if next != current {
+            self.details_scroll = 0;
+        }
         self.table_state.select(Some(next as usize));
+    }
+
+    fn scroll_details(&mut self, delta: isize) {
+        self.details_scroll = self.details_scroll.saturating_add_signed(delta);
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -326,6 +343,23 @@ impl App {
             return Ok(());
         }
 
+        if self.details_focus {
+            match key.code {
+                KeyCode::Char('j') | KeyCode::Down => self.scroll_details(1),
+                KeyCode::Char('k') | KeyCode::Up => self.scroll_details(-1),
+                KeyCode::PageDown | KeyCode::Char(' ') => {
+                    self.scroll_details(DETAILS_PAGE_LINES as isize);
+                }
+                KeyCode::PageUp => self.scroll_details(-(DETAILS_PAGE_LINES as isize)),
+                KeyCode::Char('g') | KeyCode::Home => self.details_scroll = 0,
+                KeyCode::Char('G') | KeyCode::End => self.details_scroll = usize::MAX,
+                KeyCode::Tab | KeyCode::Esc => self.details_focus = false,
+                KeyCode::Char('q') => self.quit = true,
+                _ => {}
+            }
+            return Ok(());
+        }
+
         match key.code {
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Esc => {
@@ -342,15 +376,22 @@ impl App {
             KeyCode::Char('g') | KeyCode::Home => {
                 if !self.entries.is_empty() {
                     self.table_state.select(Some(0));
+                    self.details_scroll = 0;
                 }
             }
             KeyCode::Char('G') | KeyCode::End => {
                 if !self.entries.is_empty() {
                     self.table_state.select(Some(self.entries.len() - 1));
+                    self.details_scroll = 0;
                 }
             }
             KeyCode::PageDown => self.move_selection(PAGE_SIZE as isize),
             KeyCode::PageUp => self.move_selection(-(PAGE_SIZE as isize)),
+            KeyCode::Tab => {
+                if self.selected_book().is_some() {
+                    self.details_focus = true;
+                }
+            }
             KeyCode::Char('/') => {
                 self.draft = Some(self.search.clone());
             }
@@ -591,13 +632,21 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_stateful_widget(table, area, &mut app.table_state);
 }
 
-fn draw_details(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_details(frame: &mut Frame, app: &mut App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray))
-        .title(" Details ");
+        .border_style(Style::default().fg(if app.details_focus {
+            Color::Cyan
+        } else {
+            Color::DarkGray
+        }))
+        .title(if app.details_focus {
+            " Details · scrolling "
+        } else {
+            " Details "
+        });
 
-    let paragraph = match app.selected_book() {
+    let lines = match app.selected_book() {
         Some(book) => {
             let mut lines = vec![
                 Line::from(vec![
@@ -667,24 +716,29 @@ fn draw_details(frame: &mut Frame, app: &App, area: Rect) {
 
             if let Some(description) = &book.description {
                 lines.push(Line::from(""));
-                lines.push(Line::from(util::truncate_chars(description, 600)));
+                lines.push(Line::from(util::truncate_chars(description, 4000)));
             }
-
-            Paragraph::new(Text::from(lines))
-                .block(block)
-                .wrap(Wrap { trim: true })
+            lines
         }
-        None => Paragraph::new(Text::from(vec![Line::from(Span::styled(
+        None => vec![Line::from(Span::styled(
             if app.book_count() == 0 {
                 "The library is empty. Import books with: clibrary add <file.epub>"
             } else {
                 "No books match the current filter."
             },
             Style::default().fg(Color::DarkGray),
-        ))]))
-        .block(block),
+        ))],
     };
 
+    let width = area.width.saturating_sub(2) as usize;
+    let height = area.height.saturating_sub(2) as usize;
+    let wrapped = wrap::wrap_lines(&lines, width);
+    let max_scroll = wrapped.len().saturating_sub(height);
+    app.details_scroll = app.details_scroll.min(max_scroll);
+
+    let paragraph = Paragraph::new(Text::from(wrapped))
+        .block(block)
+        .scroll((app.details_scroll as u16, 0));
     frame.render_widget(paragraph, area);
 }
 
@@ -699,6 +753,11 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(Color::DarkGray),
             ),
         ])
+    } else if app.details_focus {
+        Line::from(Span::styled(
+            " details: j/k scroll · PgDn/PgUp · g/G top/bottom · Tab/Esc back · q quit",
+            Style::default().fg(Color::DarkGray),
+        ))
     } else {
         let filter = if app.search.is_empty() {
             String::new()
@@ -707,7 +766,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         };
         Line::from(vec![
             Span::styled(
-                " q quit · j/k · / search · s sort · Enter read · o open · d delete · ? help",
+                " q quit · j/k · Tab details · / search · s sort · Enter read · o open · d delete · ? help",
                 Style::default().fg(Color::DarkGray),
             ),
             Span::styled(filter, Style::default().fg(Color::Yellow)),
@@ -732,6 +791,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         help_line("g / Home", "first book"),
         help_line("G / End", "last book"),
         help_line("PgDn / PgUp", "jump ten books"),
+        help_line("Tab", "focus the details pane (j/k scroll, Esc/Tab back)"),
         Line::from(""),
         Line::from(Span::styled("Actions", Style::default().fg(Color::Cyan))),
         help_line("/", "search title, author, series, subjects, description"),
@@ -836,6 +896,23 @@ mod tests {
         (temporary, app)
     }
 
+    fn setup_long_details() -> (tempfile::TempDir, App) {
+        let temporary = tempfile::tempdir().unwrap();
+        let mut library = Library::open(temporary.path().join("library")).unwrap();
+        for (title, author, description) in [
+            ("Long Book", "Author A", "word ".repeat(400)),
+            ("Short Book", "Author B", "Short description.".to_string()),
+        ] {
+            let mut spec = EpubSpec::new(title, author);
+            spec.description = Some(description);
+            let source = temporary.path().join(format!("{title}.epub"));
+            write_epub(&source, &spec).unwrap();
+            library.add_epub(&source).unwrap();
+        }
+        let app = App::new(library, SortKey::Title, false);
+        (temporary, app)
+    }
+
     fn render(app: &mut App, width: u16, height: u16) -> String {
         let backend = ratatui::backend::TestBackend::new(width, height);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -872,6 +949,39 @@ mod tests {
             app.selected_book()
                 .is_some_and(|book| book.title == "The Hobbit")
         );
+    }
+
+    #[test]
+    fn tab_focuses_and_scrolls_the_details_pane() {
+        let (_temporary, mut app) = setup_long_details();
+        let selected = app.selected_book().unwrap().id.clone();
+        assert_eq!(app.details_scroll, 0);
+
+        let before = render(&mut app, 100, 32);
+        assert!(before.contains("Details"));
+        assert!(before.contains("Long Book"));
+
+        press(&mut app, KeyCode::Tab);
+        assert!(app.details_focus);
+        let top = render(&mut app, 100, 32);
+        press(&mut app, KeyCode::Char('j'));
+        let scrolled = render(&mut app, 100, 32);
+        assert!(app.details_scroll > 0);
+        assert_ne!(top, scrolled);
+        assert_eq!(app.selected_book().unwrap().id, selected);
+
+        press(&mut app, KeyCode::Char('G'));
+        render(&mut app, 100, 32);
+        assert!(app.details_scroll > 1);
+        press(&mut app, KeyCode::Char('g'));
+        render(&mut app, 100, 32);
+        assert_eq!(app.details_scroll, 0);
+
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.details_focus);
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.details_scroll, 0);
+        assert_ne!(app.selected_book().unwrap().id, selected);
     }
 
     #[test]

@@ -542,8 +542,7 @@ fn read_optional_entry<R: Read + Seek>(
 
 #[derive(Debug, Clone, Default)]
 pub struct EpubBook {
-    pub title: Option<String>,
-    pub authors: Vec<String>,
+    pub meta: EpubMeta,
     pub chapters: Vec<Chapter>,
     pub toc: Vec<TocEntry>,
 }
@@ -684,8 +683,7 @@ pub fn read_book_from<R: Read + Seek>(reader: R) -> Result<EpubBook> {
     }
 
     Ok(EpubBook {
-        title: meta.title,
-        authors: meta.authors,
+        meta,
         chapters,
         toc,
     })
@@ -1539,7 +1537,7 @@ mod tests {
         write_epub(&path, &spec).unwrap();
 
         let book = read_book(&path).unwrap();
-        assert_eq!(book.title.as_deref(), Some("Test Book"));
+        assert_eq!(book.meta.title.as_deref(), Some("Test Book"));
         assert_eq!(book.chapters.len(), 2);
         assert_eq!(book.chapters[0].title.as_deref(), Some("The Beginning"));
         assert_eq!(book.toc.len(), 2);
