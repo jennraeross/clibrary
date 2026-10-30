@@ -6,7 +6,7 @@ lets you browse, search, and sort it from the terminal.
 
 ```
  clibrary   /home/you/.local/share/clibrary
- 10 books · sort: author ↑
+ 10 books · sort: recent ↓
 ┌ Books (10)───────────────────────────────────────────────────────────────┐
 │  Title                        Author              Series          Year   │
 │▶ Dune                         Frank Herbert       Dune Chronicles #1 1965│
@@ -30,8 +30,10 @@ lets you browse, search, and sort it from the terminal.
   identifiers, description, and cover image.
 - **Safe by default** — imports are copied into a temp file, checked against the
   source SHA-256, and only then committed. Duplicate content is skipped.
-- **Metadata sorting** — sort by author, title, series, publication date, or
-  the date you added a book. Missing metadata always sorts last.
+- **Recent-first sorting** — the default order shows the most recently added,
+  opened, or read books first. You can also sort by author, title, series,
+  publication date, or the date you added a book. Missing metadata always sorts
+  last.
 - **Search** across title, authors, series, subjects, description, identifiers,
   and book ID.
 - **A real TUI** — browse, filter, inspect, read, open, and delete books without
@@ -100,7 +102,7 @@ CLIBRARY_DIR=~/Books/clibrary clibrary
 | --- | --- |
 | `clibrary` | Open the interactive browser (same as `clibrary tui`). |
 | `clibrary add <PATH>...` | Import EPUB files, or scan directories recursively. `--move` deletes sources after a verified copy; `--dry-run` previews; `--json` prints results. |
-| `clibrary list [QUERY]` | List books, optionally filtered. `--sort author\|title\|series\|published\|added` (also `date`/`year` for published), `--reverse`, `--json`. |
+| `clibrary list [QUERY]` | List books, optionally filtered. `--sort recent\|author\|title\|series\|published\|added` (also `date`/`year` for published), `--reverse`, `--json`. Defaults to `recent`. |
 | `clibrary show <QUERY>` | Show full metadata for one book. `--json`. |
 | `clibrary open <QUERY>` | Open the book in the system EPUB viewer. |
 | `clibrary export <QUERY> --to <DIR>` | Copy a book out of the library (never overwrites). |
@@ -125,8 +127,8 @@ Add JSON output includes a `status` of `added`, `duplicate`, `would-add`, or
 | `Tab` | Focus the Details pane (`j`/`k`, `PgDn`/`PgUp`, `g`/`G` scroll; `Tab`/`Esc` back) |
 | `/` | Search (live filter; `Enter` applies, `Esc` cancels) |
 | `Esc` | Clear the active filter, or quit when there is no filter |
-| `s` | Cycle sort: author → title → series → published → added |
-| `S` | Reverse the sort order |
+| `s` | Cycle sort: recent → author → title → series → published → added |
+| `S` | Reverse the sort order (`recent` starts newest-first) |
 | `Enter` | Read the selected EPUB inside `clibrary` |
 | `o` | Open the selected EPUB in the system viewer |
 | `d` | Delete the book and its files (asks for `y`/`n`) |
@@ -135,6 +137,11 @@ Add JSON output includes a `status` of `added`, `duplicate`, `would-add`, or
 | `q` / `Ctrl-C` | Quit |
 
 Books whose EPUB file has disappeared are shown dimmed with `(missing)`.
+
+The `recent` sort uses the latest of three timestamps: when a book was added,
+when it was last opened (`Enter`, `o`, or `clibrary open`), and when its reading
+position was last saved. Opening or reading a book therefore moves it back to
+the top. Press `S` to see the oldest activity first instead.
 
 ## Reading mode
 
@@ -150,7 +157,8 @@ into two columns and read left column first, then right. `c` cycles between
 automatic, single-column, and two-column layouts. Resizing the terminal reflows
 the text while keeping your approximate place in the chapter. `+` and `-` widen
 or narrow the columns in four-cell steps (from 20 up to 76 cells); `0` restores
-the automatic width.
+the automatic width. Your chosen width is remembered in the library index and
+reused for every book, including after you restart `clibrary`.
 
 Book text always moves by whole pages. There is no line-by-line scrolling, so a
 page turn replaces the whole screen (or spread) and dual-column pages never
@@ -186,7 +194,7 @@ The `m` metadata popup and the browser's Details pane scroll with `j`/`k`,
 
 ```
 library/
-├── index.json          # metadata and reading progress, atomically rewritten
+├── index.json          # metadata, progress, and reader settings (atomic rewrite)
 ├── library.lock        # advisory lock for writers
 └── books/
     └── Author Name/
@@ -199,8 +207,9 @@ If a second book has the same title and author, its directory gets a short
 content hash suffix instead of overwriting the first. Covers are stored next to
 the EPUB using their original image format.
 
-The index is JSON, one version field plus a book array, so it is easy to inspect
-or back up. Files are never hard-linked or modified in place.
+The index is JSON, one version field, a reader-settings object, and a book
+array, so it is easy to inspect or back up. Files are never hard-linked or
+modified in place.
 
 ## Safety model
 

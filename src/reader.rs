@@ -93,6 +93,12 @@ impl Reader {
         Self::from_book_at(book, None)
     }
 
+    /// Start with a previously saved column width (`None` keeps it automatic).
+    pub fn with_column_width(mut self, width: Option<u16>) -> Self {
+        self.col_width_target = width;
+        self
+    }
+
     pub fn from_book_at(book: EpubBook, progress: Option<ReadingProgress>) -> Result<Self> {
         if book.chapters.is_empty() {
             bail!("this EPUB does not contain any readable text");
@@ -655,6 +661,11 @@ impl Reader {
 
     pub fn columns(&self) -> usize {
         self.columns
+    }
+
+    /// User-requested column width, or `None` when the automatic width is active.
+    pub fn column_width_target(&self) -> Option<u16> {
+        self.col_width_target
     }
 
     pub fn chapter(&self) -> usize {
@@ -1283,6 +1294,30 @@ mod tests {
         press(&mut reader, KeyCode::Char('0'));
         assert_eq!(reader.col_width, MAX_COLUMN_WIDTH);
         assert_eq!(reader.col_width_target, None);
+    }
+
+    #[test]
+    fn restores_a_saved_column_width() {
+        let mut reader = Reader::from_book(sample_book())
+            .unwrap()
+            .with_column_width(Some(40));
+        assert_eq!(reader.column_width_target(), Some(40));
+        reader.set_screen(Rect::new(0, 0, 80, 24));
+        reader.relayout(Rect::new(0, 0, 80, 24));
+        assert_eq!(reader.columns(), 1);
+        assert_eq!(reader.col_width, 40);
+
+        // A hand-edited value outside the supported range is still clamped.
+        let mut reader = Reader::from_book(sample_book())
+            .unwrap()
+            .with_column_width(Some(4));
+        reader.set_screen(Rect::new(0, 0, 80, 24));
+        reader.relayout(Rect::new(0, 0, 80, 24));
+        assert_eq!(reader.col_width, MIN_ADJUSTED_COLUMN_WIDTH);
+
+        press(&mut reader, KeyCode::Char('0'));
+        assert_eq!(reader.column_width_target(), None);
+        assert_eq!(reader.col_width, MAX_COLUMN_WIDTH);
     }
 
     #[test]

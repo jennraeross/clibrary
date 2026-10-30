@@ -17,7 +17,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap};
 
 use crate::library::Library;
-use crate::model::{Book, SortKey, sorted_indices};
+use crate::model::{Book, ReaderSettings, SortKey, sorted_indices};
 use crate::reader::{Reader, ReaderAction};
 use crate::util;
 use crate::wrap;
@@ -106,6 +106,7 @@ struct App {
     quit: bool,
     reader: Option<Reader>,
     reader_book: Option<String>,
+    reader_column_width: Option<u16>,
     details_scroll: usize,
     details_focus: bool,
 }
@@ -127,6 +128,7 @@ impl App {
             quit: false,
             reader: None,
             reader_book: None,
+            reader_column_width: None,
             details_scroll: 0,
             details_focus: false,
         };
@@ -211,8 +213,19 @@ impl App {
             return;
         };
         let progress = reader.position();
-        if let Some(book_id) = self.reader_book.take()
+        let column_width = reader.column_width_target();
+        let book_id = self.reader_book.take();
+        let width_changed = column_width != self.reader_column_width;
+        self.reader_column_width = column_width;
+        if let Some(book_id) = book_id
             && let Err(error) = self.library.set_reading_progress(&book_id, progress)
+        {
+            self.set_status(format!("{error:#}"), true);
+        }
+        if width_changed
+            && let Err(error) = self
+                .library
+                .set_reader_settings(ReaderSettings { column_width })
         {
             self.set_status(format!("{error:#}"), true);
         }
@@ -407,11 +420,7 @@ impl App {
                     format!(
                         "Sorted by {} ({})",
                         self.sort.label(),
-                        if self.reverse {
-                            "descending"
-                        } else {
-                            "ascending"
-                        }
+                        self.sort.direction_label(self.reverse)
                     ),
                     false,
                 );
@@ -432,6 +441,9 @@ impl App {
                     match util::open_in_viewer(&path) {
                         Ok(()) => {
                             self.set_status(format!("Opening {}", path.display()), false);
+                            if let Err(error) = self.library.record_opened(&book.id) {
+                                self.set_status(format!("{error:#}"), true);
+                            }
                         }
                         Err(error) => self.set_status(format!("{error:#}"), true),
                     }
@@ -447,9 +459,12 @@ impl App {
                 } else {
                     match Reader::open_at(&path, book.reading_progress) {
                         Ok(reader) => {
-                            self.status = None;
-                            self.reader = Some(reader);
+                            let column_width = self.library.reader_settings().column_width;
+                            let record_error = self.library.record_opened(&book.id).err();
+                            self.reader = Some(reader.with_column_width(column_width));
                             self.reader_book = Some(book.id);
+                            self.reader_column_width = column_width;
+                            self.status = record_error.map(|error| (format!("{error:#}"), true));
                         }
                         Err(error) => self.set_status(format!("{error:#}"), true),
                     }
@@ -510,7 +525,7 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         app.book_count(),
         if app.book_count() == 1 { "" } else { "s" },
         app.sort.label(),
-        if app.reverse { "↓" } else { "↑" }
+        app.sort.arrow(app.reverse)
     );
     let missing = app.missing_count();
     if missing > 0 {
@@ -795,7 +810,10 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from(""),
         Line::from(Span::styled("Actions", Style::default().fg(Color::Cyan))),
         help_line("/", "search title, author, series, subjects, description"),
-        help_line("s", "cycle sort: author, title, series, published, added"),
+        help_line(
+            "s",
+            "cycle sort: recent, author, title, series, published, added",
+        ),
         help_line("S", "reverse the sort order"),
         help_line("Enter", "read the selected EPUB inside clibrary"),
         help_line("o", "open the selected EPUB in your system viewer"),
@@ -1069,6 +1087,19 @@ mod tests {
     }
 
     #[test]
+    fn opening_a_book_records_the_open_time() {
+        let (_temporary, mut app) = setup();
+        let id = app.selected_book().unwrap().id.clone();
+        assert!(app.library.resolve(&id).unwrap().last_opened_at.is_none());
+
+        press(&mut app, KeyCode::Enter);
+        assert!(app.reader.is_some());
+        assert!(app.library.resolve(&id).unwrap().last_opened_at.is_some());
+
+        press(&mut app, KeyCode::Esc);
+    }
+
+    #[test]
     fn saves_and_restores_the_reading_position() {
         let temporary = tempfile::tempdir().unwrap();
         let mut library = Library::open(temporary.path().join("library")).unwrap();
@@ -1116,6 +1147,42 @@ mod tests {
         press(&mut app, KeyCode::Esc);
         let screen = render(&mut app, 100, 30);
         assert!(screen.contains("Reading:"));
+    }
+
+    #[test]
+    fn remembers_the_column_width_between_sessions() {
+        let (_temporary, mut app) = setup();
+        render(&mut app, 100, 30);
+        press(&mut app, KeyCode::Enter);
+        render(&mut app, 100, 30);
+        assert_eq!(app.reader.as_ref().unwrap().column_width_target(), None);
+
+        press(&mut app, KeyCode::Char('-'));
+        assert_eq!(app.reader.as_ref().unwrap().column_width_target(), Some(72));
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.library.reader_settings().column_width, Some(72));
+
+        // Reopening a book in the same session restores the saved width.
+        press(&mut app, KeyCode::Enter);
+        render(&mut app, 100, 30);
+        assert_eq!(app.reader.as_ref().unwrap().column_width_target(), Some(72));
+        press(&mut app, KeyCode::Esc);
+
+        // A fresh process reads it back from the index.
+        let root = app.library.root().to_path_buf();
+        drop(app);
+        let library = Library::open(root).unwrap();
+        assert_eq!(library.reader_settings().column_width, Some(72));
+
+        // `0` clears the saved preference.
+        let mut app = App::new(library, SortKey::Title, false);
+        render(&mut app, 100, 30);
+        press(&mut app, KeyCode::Enter);
+        render(&mut app, 100, 30);
+        assert_eq!(app.reader.as_ref().unwrap().column_width_target(), Some(72));
+        press(&mut app, KeyCode::Char('0'));
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.library.reader_settings().column_width, None);
     }
 
     #[test]

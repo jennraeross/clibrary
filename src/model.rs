@@ -8,6 +8,8 @@ pub const INDEX_VERSION: u32 = 1;
 /// How books are ordered in the browser and in `clibrary list`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum SortKey {
+    /// Most recent activity first: added, opened, or read.
+    Recent,
     Title,
     Author,
     Series,
@@ -17,7 +19,8 @@ pub enum SortKey {
 }
 
 impl SortKey {
-    pub const ALL: [SortKey; 5] = [
+    pub const ALL: [SortKey; 6] = [
+        SortKey::Recent,
         SortKey::Author,
         SortKey::Title,
         SortKey::Series,
@@ -32,11 +35,37 @@ impl SortKey {
 
     pub fn label(self) -> &'static str {
         match self {
+            SortKey::Recent => "recent",
             SortKey::Title => "title",
             SortKey::Author => "author",
             SortKey::Series => "series",
             SortKey::Published => "published",
             SortKey::Added => "added",
+        }
+    }
+
+    /// Whether this key and direction put the largest/newest value first.
+    pub fn descending(self, reverse: bool) -> bool {
+        match self {
+            // `recent` naturally reads newest first.
+            SortKey::Recent => !reverse,
+            _ => reverse,
+        }
+    }
+
+    pub fn arrow(self, reverse: bool) -> &'static str {
+        if self.descending(reverse) {
+            "↓"
+        } else {
+            "↑"
+        }
+    }
+
+    pub fn direction_label(self, reverse: bool) -> &'static str {
+        if self.descending(reverse) {
+            "descending"
+        } else {
+            "ascending"
         }
     }
 }
@@ -46,6 +75,8 @@ pub struct Index {
     pub version: u32,
     #[serde(default)]
     pub books: Vec<Book>,
+    #[serde(default)]
+    pub reader: ReaderSettings,
 }
 
 impl Default for Index {
@@ -53,8 +84,17 @@ impl Default for Index {
         Self {
             version: INDEX_VERSION,
             books: Vec::new(),
+            reader: ReaderSettings::default(),
         }
     }
+}
+
+/// Reader preferences shared by every book in the library.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReaderSettings {
+    /// User-requested column width; `None` means the automatic width.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub column_width: Option<u16>,
 }
 
 /// A saved place in a book, stored in the library index.
@@ -128,6 +168,9 @@ pub struct Book {
     pub cover_path: Option<String>,
     /// Unix timestamp (seconds) of when the book was imported.
     pub added_at: i64,
+    /// Unix timestamp (seconds) of when the book was last opened in a viewer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_opened_at: Option<i64>,
     /// Size of the EPUB in bytes.
     pub size: u64,
     /// Where the reader left off, if the book has been read in clibrary.
@@ -158,6 +201,17 @@ impl Book {
 
     pub fn added_display(&self) -> String {
         crate::util::format_timestamp(self.added_at)
+    }
+
+    /// Most recent activity: added, opened, or read.
+    fn recent_timestamp(&self) -> i64 {
+        let read = self
+            .reading_progress
+            .map(|progress| progress.updated_at)
+            .unwrap_or(0);
+        self.added_at
+            .max(self.last_opened_at.unwrap_or(0))
+            .max(read)
     }
 
     pub fn size_display(&self) -> String {
@@ -262,6 +316,14 @@ fn cmp_opt_reverse<T: PartialOrd>(a: Option<T>, b: Option<T>, reverse: bool) -> 
 /// Compare two books by a metadata field. Missing metadata sorts last.
 pub fn compare_books(a: &Book, b: &Book, key: SortKey, reverse: bool) -> Ordering {
     let primary = match key {
+        SortKey::Recent => {
+            let ordering = a.recent_timestamp().cmp(&b.recent_timestamp());
+            if reverse {
+                ordering
+            } else {
+                ordering.reverse()
+            }
+        }
         SortKey::Title => cmp_text(&a.title, &b.title, reverse),
         SortKey::Author => cmp_opt_text(a.sort_author(), b.sort_author(), reverse),
         SortKey::Series => cmp_opt_text(a.series.as_deref(), b.series.as_deref(), reverse)
@@ -281,8 +343,15 @@ pub fn compare_books(a: &Book, b: &Book, key: SortKey, reverse: bool) -> Orderin
             }
         }
     };
+    // Recent ties usually mean several books share a timestamp; alphabetical
+    // order is more useful than reversing the title along with the dates.
+    let tie_reverse = if key == SortKey::Recent {
+        false
+    } else {
+        reverse
+    };
     primary
-        .then_with(|| cmp_text(&a.title, &b.title, reverse))
+        .then_with(|| cmp_text(&a.title, &b.title, tie_reverse))
         .then_with(|| a.id.cmp(&b.id))
 }
 
@@ -331,6 +400,7 @@ mod tests {
             epub_path: "books/x/book.epub".to_string(),
             cover_path: None,
             added_at: 0,
+            last_opened_at: None,
             size: 0,
             reading_progress: None,
         }
@@ -365,6 +435,53 @@ mod tests {
         assert_eq!(missing_date.last(), Some(&2));
         let missing_date_desc = sorted_indices(&books, SortKey::Published, true, None);
         assert_eq!(missing_date_desc.last(), Some(&2));
+    }
+
+    #[test]
+    fn sorts_by_recent_activity() {
+        let mut books = vec![
+            book("Added Old", "A", None, None, "1990"),
+            book("Opened", "B", None, None, "1990"),
+            book("Read", "C", None, None, "1990"),
+            book("Untouched", "D", None, None, "1990"),
+        ];
+        books[0].added_at = 300;
+        books[1].added_at = 100;
+        books[1].last_opened_at = Some(500);
+        books[2].added_at = 100;
+        books[2].reading_progress = Some(ReadingProgress {
+            chapter: 0,
+            chapters: 1,
+            fraction: 0.5,
+            updated_at: 700,
+        });
+
+        let recent = sorted_indices(&books, SortKey::Recent, false, None);
+        assert_eq!(recent, vec![2, 1, 0, 3]);
+        assert!(SortKey::Recent.descending(false));
+        assert_eq!(SortKey::Recent.arrow(false), "↓");
+
+        let oldest = sorted_indices(&books, SortKey::Recent, true, None);
+        assert_eq!(oldest, vec![3, 0, 1, 2]);
+        assert!(!SortKey::Recent.descending(true));
+        assert_eq!(SortKey::Recent.arrow(true), "↑");
+
+        // Added and opened still win when they are the newest activity.
+        books[1].last_opened_at = Some(900);
+        let recent = sorted_indices(&books, SortKey::Recent, false, None);
+        assert_eq!(recent[0], 1);
+    }
+
+    #[test]
+    fn recent_ties_break_alphabetically() {
+        let books = vec![
+            book("Zebra", "A", None, None, "1990"),
+            book("Apple", "B", None, None, "1990"),
+        ];
+        let recent = sorted_indices(&books, SortKey::Recent, false, None);
+        assert_eq!(recent, vec![1, 0]);
+        let recent_reversed = sorted_indices(&books, SortKey::Recent, true, None);
+        assert_eq!(recent_reversed, vec![1, 0]);
     }
 
     #[test]

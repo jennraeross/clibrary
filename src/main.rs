@@ -35,9 +35,9 @@ enum Command {
     /// Open the interactive browser (the default when no command is given)
     Tui {
         /// Metadata field to sort by
-        #[arg(long, value_enum, default_value_t = SortKey::Author)]
+        #[arg(long, value_enum, default_value_t = SortKey::Recent)]
         sort: SortKey,
-        /// Sort in descending order
+        /// Reverse the sort order
         #[arg(long)]
         reverse: bool,
     },
@@ -62,9 +62,9 @@ enum Command {
         #[arg(value_name = "QUERY")]
         query: Option<String>,
         /// Metadata field to sort by
-        #[arg(long, value_enum, default_value_t = SortKey::Author)]
+        #[arg(long, value_enum, default_value_t = SortKey::Recent)]
         sort: SortKey,
-        /// Sort in descending order
+        /// Reverse the sort order
         #[arg(long)]
         reverse: bool,
         /// Print the matching books as JSON
@@ -125,7 +125,7 @@ fn run() -> Result<ExitCode> {
 
     let Some(command) = cli.command else {
         let library = Library::open(root)?;
-        tui::run(library, SortKey::Author, false)?;
+        tui::run(library, SortKey::Recent, false)?;
         return Ok(ExitCode::SUCCESS);
     };
 
@@ -590,13 +590,16 @@ fn ask_confirmation(prompt: &str) -> Result<bool> {
 }
 
 fn open(root: &Path, query: &str) -> Result<ExitCode> {
-    let library = Library::open(root)?;
-    let book = library.resolve(query)?;
-    let path = library.book_path(book);
+    let mut library = Library::open(root)?;
+    let book = library.resolve(query)?.clone();
+    let path = library.book_path(&book);
     if !path.is_file() {
         bail!("the EPUB file is missing: {}", path.display());
     }
     util::open_in_viewer(&path)?;
+    if let Err(error) = library.record_opened(&book.id) {
+        eprintln!("warning: {error:#}");
+    }
     println!("Opening {}", path.display());
     Ok(ExitCode::SUCCESS)
 }

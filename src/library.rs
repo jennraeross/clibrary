@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use fs2::FileExt;
 
 use crate::epub;
-use crate::model::{Book, INDEX_VERSION, Index, ReadingProgress};
+use crate::model::{Book, INDEX_VERSION, Index, ReaderSettings, ReadingProgress};
 use crate::util;
 
 pub struct Library {
@@ -62,6 +62,10 @@ impl Library {
 
     pub fn books(&self) -> &[Book] {
         &self.index.books
+    }
+
+    pub fn reader_settings(&self) -> &ReaderSettings {
+        &self.index.reader
     }
 
     pub fn index_path(&self) -> PathBuf {
@@ -241,6 +245,7 @@ impl Library {
             epub_path: relative_epub,
             cover_path,
             added_at: util::now_unix(),
+            last_opened_at: None,
             size,
             reading_progress: None,
         };
@@ -276,6 +281,39 @@ impl Library {
         if let Err(error) = self.save() {
             self.index.books[position].reading_progress = previous;
             return Err(error.context("could not save reading progress"));
+        }
+        Ok(())
+    }
+
+    /// Record that a book was opened, either in the in-app reader or a
+    /// system viewer.
+    pub fn record_opened(&mut self, id: &str) -> Result<()> {
+        let _lock = self.lock()?;
+        self.reload()?;
+        let position = self
+            .index
+            .books
+            .iter()
+            .position(|book| book.id == id)
+            .with_context(|| format!("book {id} is not in the library"))?;
+        let previous = self.index.books[position]
+            .last_opened_at
+            .replace(util::now_unix());
+        if let Err(error) = self.save() {
+            self.index.books[position].last_opened_at = previous;
+            return Err(error.context("could not save the open time"));
+        }
+        Ok(())
+    }
+
+    /// Record the reader preferences shared by every book.
+    pub fn set_reader_settings(&mut self, settings: ReaderSettings) -> Result<()> {
+        let _lock = self.lock()?;
+        self.reload()?;
+        let previous = std::mem::replace(&mut self.index.reader, settings);
+        if let Err(error) = self.save() {
+            self.index.reader = previous;
+            return Err(error.context("could not save reader settings"));
         }
         Ok(())
     }
@@ -629,6 +667,60 @@ mod tests {
         library.remove(&book.id, false).unwrap();
         let reopened = Library::open(library.root().to_path_buf()).unwrap();
         assert!(reopened.books().is_empty());
+    }
+
+    #[test]
+    fn records_the_last_open_time() {
+        let (temporary, mut library) = setup();
+        let book = add_book(
+            &mut library,
+            temporary.path(),
+            &EpubSpec::new("Open Me", "An Author"),
+        );
+        assert!(book.last_opened_at.is_none());
+
+        let progress = ReadingProgress {
+            chapter: 1,
+            chapters: 3,
+            fraction: 0.5,
+            updated_at: 0,
+        };
+        library.set_reading_progress(&book.id, progress).unwrap();
+        library.record_opened(&book.id).unwrap();
+
+        let stored = library.books()[0].clone();
+        assert!(stored.last_opened_at.is_some_and(|opened| opened > 0));
+        assert_eq!(
+            stored.reading_progress.map(|progress| progress.chapter),
+            Some(1)
+        );
+
+        let reopened = Library::open(library.root().to_path_buf()).unwrap();
+        assert_eq!(reopened.books()[0].last_opened_at, stored.last_opened_at);
+
+        assert!(library.record_opened("missing").is_err());
+    }
+
+    #[test]
+    fn persists_reader_settings() {
+        let (_temporary, mut library) = setup();
+        assert_eq!(library.reader_settings().column_width, None);
+
+        library
+            .set_reader_settings(ReaderSettings {
+                column_width: Some(52),
+            })
+            .unwrap();
+        assert_eq!(library.reader_settings().column_width, Some(52));
+
+        let reopened = Library::open(library.root().to_path_buf()).unwrap();
+        assert_eq!(reopened.reader_settings().column_width, Some(52));
+
+        library
+            .set_reader_settings(ReaderSettings { column_width: None })
+            .unwrap();
+        let reopened = Library::open(library.root().to_path_buf()).unwrap();
+        assert_eq!(reopened.reader_settings().column_width, None);
     }
 
     #[test]

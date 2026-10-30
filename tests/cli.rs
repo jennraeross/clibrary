@@ -86,6 +86,37 @@ fn assert_success(output: &Output) {
 }
 
 #[test]
+fn list_defaults_to_recent_activity() {
+    let env = TestEnv::new();
+    let (_older, output) = env.add_spec(&EpubSpec::new("Older", "An Author"));
+    assert_success(&output);
+    let (_newer, output) = env.add_spec(&EpubSpec::new("Newer", "An Author"));
+    assert_success(&output);
+
+    // Imports can land in the same second, so pin the timestamps to make the
+    // expected order unambiguous.
+    let path = env.library.join("index.json");
+    let mut index: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    for book in index["books"].as_array_mut().unwrap() {
+        let older = book["title"].as_str() == Some("Older");
+        book["added_at"] = serde_json::json!(if older { 100 } else { 200 });
+    }
+    fs::write(&path, serde_json::to_vec(&index).unwrap()).unwrap();
+
+    let list = env.run(&["list", "--json"]);
+    assert_success(&list);
+    let listed: Vec<Book> = serde_json::from_slice(&list.stdout).unwrap();
+    assert_eq!(listed[0].title, "Newer");
+    assert_eq!(listed[1].title, "Older");
+
+    let oldest = env.run(&["list", "--sort", "recent", "--reverse", "--json"]);
+    assert_success(&oldest);
+    let listed: Vec<Book> = serde_json::from_slice(&oldest.stdout).unwrap();
+    assert_eq!(listed[0].title, "Older");
+    assert_eq!(listed[1].title, "Newer");
+}
+
+#[test]
 fn full_workflow_add_list_show_export_remove() {
     let env = TestEnv::new();
     let (hobbit_source, output) = env.add_spec(&EpubSpec {
