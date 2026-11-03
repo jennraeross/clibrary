@@ -1,4 +1,5 @@
 pub mod epub;
+pub mod fanficfare;
 pub mod library;
 pub mod model;
 pub mod reader;

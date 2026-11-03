@@ -5,7 +5,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use clibrary::library::Library;
 use clibrary::model::Book;
+use clibrary::model::ReadingProgress;
 use fixtures::{EpubSpec, write_epub, write_epub_with_rootfile};
 use serde::Deserialize;
 use tempfile::TempDir;
@@ -30,6 +32,14 @@ impl TestEnv {
 
     fn run(&self, arguments: &[&str]) -> Output {
         self.command().args(arguments).output().unwrap()
+    }
+
+    fn run_with_path(&self, arguments: &[&str], path: &str) -> Output {
+        self.command()
+            .env("PATH", path)
+            .args(arguments)
+            .output()
+            .unwrap()
     }
 
     fn add(&self, path: &Path) -> Output {
@@ -372,6 +382,137 @@ fn interactive_mode_requires_a_terminal() {
     let output = env.run(&[]);
     assert!(!output.status.success());
     assert!(stderr(&output).contains("needs a terminal"));
+}
+
+#[test]
+fn download_rejects_non_web_urls_with_json_error() {
+    let env = TestEnv::new();
+    let output = env.run(&["download", "file:///tmp/story", "--json"]);
+    assert!(!output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(output.stderr.is_empty());
+    assert_eq!(report[0]["status"], "error");
+    assert!(
+        report[0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("HTTP or HTTPS")
+    );
+}
+
+#[test]
+fn update_rejects_books_without_fanficfare_metadata() {
+    let env = TestEnv::new();
+    let (_source, added) = env.add_spec(&EpubSpec::new("Not a Fic", "An Author"));
+    assert_success(&added);
+    let id = env.index()[0].id.clone();
+    let output = env.run(&["update", &id, "--json"]);
+    assert!(!output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report[0]["status"], "error");
+    assert!(
+        report[0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("no FanFicFare source URL")
+    );
+}
+
+#[test]
+fn update_all_reports_when_no_fanficfare_stories_exist() {
+    let env = TestEnv::new();
+    let output = env.run(&["update", "--json"]);
+    assert!(!output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report[0]["status"], "error");
+    assert!(
+        report[0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("no FanFicFare stories")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn downloads_and_updates_fics_through_fanficfare() {
+    use std::os::unix::fs::PermissionsExt;
+
+    fn quote(path: &Path) -> String {
+        format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+    }
+
+    let env = TestEnv::new();
+    let url = "https://archive.example/story/24";
+    let initial_epub = env.temporary.path().join("initial.epub");
+    write_epub(
+        &initial_epub,
+        &EpubSpec {
+            source_url: Some(url.to_string()),
+            ..EpubSpec::new("Tracked Fic", "An Author")
+        },
+    )
+    .unwrap();
+    let updated_epub = env.temporary.path().join("updated.epub");
+    write_epub(
+        &updated_epub,
+        &EpubSpec {
+            title: Some("Tracked Fic Updated".to_string()),
+            source_url: Some(url.to_string()),
+            ..EpubSpec::new("Tracked Fic Updated", "An Author")
+        },
+    )
+    .unwrap();
+
+    let fake_bin = env.temporary.path().join("bin");
+    fs::create_dir(&fake_bin).unwrap();
+    let executable = fake_bin.join("fanficfare");
+    fs::write(
+        &executable,
+        format!(
+            "#!/bin/sh\nif [ \"$2\" = \"--format\" ]; then\n  /bin/cp -- {} \"$PWD/story.epub\"\nelif [ \"$2\" = \"--update-epub\" ]; then\n  /bin/cp -- {} \"$3\"\nelse\n  exit 12\nfi\n",
+            quote(&initial_epub),
+            quote(&updated_epub)
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    let path = format!(
+        "{}:{}",
+        fake_bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let downloaded = env.run_with_path(&["download", url, "--json"], &path);
+    assert_success(&downloaded);
+    let report: serde_json::Value = serde_json::from_slice(&downloaded.stdout).unwrap();
+    assert_eq!(report[0]["status"], "downloaded");
+    let original = env.index().remove(0);
+    assert_eq!(original.source_url(), Some(url));
+
+    let mut library = Library::open(&env.library).unwrap();
+    library
+        .set_reading_progress(
+            &original.id,
+            ReadingProgress {
+                chapter: 2,
+                chapters: 5,
+                fraction: 0.25,
+                updated_at: 1,
+            },
+        )
+        .unwrap();
+
+    let updated = env.run_with_path(&["update", &original.id, "--json"], &path);
+    assert_success(&updated);
+    let report: serde_json::Value = serde_json::from_slice(&updated.stdout).unwrap();
+    assert_eq!(report[0]["status"], "updated");
+    let books = env.index();
+    assert_eq!(books.len(), 1);
+    assert_ne!(books[0].id, original.id);
+    assert_eq!(books[0].title, "Tracked Fic Updated");
+    assert_eq!(books[0].source_url(), Some(url));
+    assert_eq!(books[0].reading_progress.unwrap().chapter, 2);
 }
 
 #[cfg(unix)]

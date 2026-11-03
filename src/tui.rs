@@ -1,5 +1,7 @@
 use std::io::{self, IsTerminal};
 use std::panic;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -16,14 +18,24 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap};
 
-use crate::library::Library;
+use crate::library::{AddOutcome, Library, UpdateOutcome};
 use crate::model::{Book, ReaderSettings, SortKey, sorted_indices};
 use crate::reader::{Reader, ReaderAction};
-use crate::util;
 use crate::wrap;
+use crate::{fanficfare, util};
 
 const PAGE_SIZE: usize = 10;
 const DETAILS_PAGE_LINES: usize = 5;
+
+enum PendingAction {
+    Download,
+    Update(Box<Book>),
+}
+
+struct PendingTask {
+    action: PendingAction,
+    receiver: Receiver<Result<fanficfare::StagedEpub>>,
+}
 
 pub fn run(library: Library, sort: SortKey, reverse: bool) -> Result<()> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
@@ -82,11 +94,15 @@ fn event_loop<B: Backend>(terminal: &mut ratatui::Terminal<B>, app: &mut App) ->
         if app.quit {
             return Ok(());
         }
-        if event::poll(Duration::from_millis(250)).context("cannot read terminal events")?
+        if event::poll(Duration::from_millis(120)).context("cannot read terminal events")?
             && let Event::Key(key) = event::read().context("cannot read terminal events")?
             && key.kind == KeyEventKind::Press
         {
             app.handle_key(key)?;
+        }
+        app.poll_pending_task();
+        if app.pending_task.is_some() {
+            app.spinner_frame = (app.spinner_frame + 1) % 4;
         }
     }
 }
@@ -100,6 +116,9 @@ struct App {
     table_state: TableState,
     search: String,
     draft: Option<String>,
+    url_input: Option<String>,
+    pending_task: Option<PendingTask>,
+    spinner_frame: usize,
     status: Option<(String, bool)>,
     confirm: Option<String>,
     help: bool,
@@ -122,6 +141,9 @@ impl App {
             table_state: TableState::default(),
             search: String::new(),
             draft: None,
+            url_input: None,
+            pending_task: None,
+            spinner_frame: 0,
             status: None,
             confirm: None,
             help: false,
@@ -250,6 +272,104 @@ impl App {
         self.details_scroll = self.details_scroll.saturating_add_signed(delta);
     }
 
+    fn download_url(&mut self, url: &str) {
+        if self.pending_task.is_some() {
+            return;
+        }
+        let url = url.to_string();
+        let worker_url = url.clone();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = sender.send(fanficfare::download(&worker_url));
+        });
+        self.pending_task = Some(PendingTask {
+            action: PendingAction::Download,
+            receiver,
+        });
+        self.spinner_frame = 0;
+        self.set_status(format!("Downloading {url}"), false);
+    }
+
+    fn update_selected(&mut self) {
+        if self.pending_task.is_some() {
+            return;
+        }
+        let Some(book) = self.selected_book().cloned() else {
+            return;
+        };
+        if book.source_url().is_none() {
+            self.set_status("Selected book has no FanFicFare source URL", true);
+            return;
+        }
+        self.set_status(format!("Updating {}", book.title), false);
+        let path = self.library.book_path(&book);
+        let worker_book = book.clone();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = sender.send(fanficfare::update(&worker_book, &path));
+        });
+        self.pending_task = Some(PendingTask {
+            action: PendingAction::Update(Box::new(book)),
+            receiver,
+        });
+        self.spinner_frame = 0;
+    }
+
+    fn poll_pending_task(&mut self) {
+        let completed = match self.pending_task.as_ref() {
+            Some(task) => match task.receiver.try_recv() {
+                Ok(result) => Some(result),
+                Err(TryRecvError::Disconnected) => Some(Err(anyhow::anyhow!(
+                    "FanFicFare task ended without a result"
+                ))),
+                Err(TryRecvError::Empty) => None,
+            },
+            None => None,
+        };
+        let Some(result) = completed else {
+            return;
+        };
+        let Some(task) = self.pending_task.take() else {
+            return;
+        };
+        let staged = match result {
+            Ok(staged) => staged,
+            Err(error) => {
+                self.set_status(format!("{error:#}"), true);
+                return;
+            }
+        };
+        match task.action {
+            PendingAction::Download => match self.library.add_epub(staged.path()) {
+                Ok(AddOutcome::Added(book)) => {
+                    self.set_status(format!("Downloaded \"{}\"", book.title), false);
+                    self.refresh_missing();
+                    self.rebuild();
+                }
+                Ok(AddOutcome::Duplicate(book)) => {
+                    self.set_status(format!("Already in library: \"{}\"", book.title), false);
+                }
+                Err(error) => self.set_status(format!("{error:#}"), true),
+            },
+            PendingAction::Update(book) => {
+                match self.library.update_epub(&book.id, staged.path()) {
+                    Ok(UpdateOutcome::Updated(updated)) => {
+                        self.set_status(format!("Updated \"{}\"", updated.title), false);
+                        self.refresh_missing();
+                        self.rebuild();
+                    }
+                    Ok(UpdateOutcome::Unchanged(unchanged)) => {
+                        self.set_status(
+                            format!("No new chapters for \"{}\"", unchanged.title),
+                            false,
+                        );
+                    }
+                    Err(error) => self.set_status(format!("{error:#}"), true),
+                }
+            }
+        }
+    }
+
     fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
         let ctrl_c = key.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'));
@@ -266,6 +386,13 @@ impl App {
                 .is_some_and(|reader| reader.handle_key(key) == ReaderAction::Close);
             if close {
                 self.close_reader();
+            }
+            return Ok(());
+        }
+
+        if self.pending_task.is_some() {
+            if ctrl_c {
+                self.quit = true;
             }
             return Ok(());
         }
@@ -307,6 +434,37 @@ impl App {
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                     self.confirm = None;
                     self.set_status("Delete cancelled", false);
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+
+        if self.url_input.is_some() {
+            match key.code {
+                KeyCode::Esc => {
+                    self.url_input = None;
+                    self.set_status("Download cancelled", false);
+                }
+                KeyCode::Enter => {
+                    if let Some(url) = self.url_input.take() {
+                        self.download_url(url.trim());
+                    }
+                }
+                KeyCode::Backspace => {
+                    if let Some(url) = self.url_input.as_mut() {
+                        url.pop();
+                    }
+                }
+                KeyCode::Delete => self.url_input = Some(String::new()),
+                KeyCode::Char(character)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    if let Some(url) = self.url_input.as_mut() {
+                        url.push(character);
+                    }
                 }
                 _ => {}
             }
@@ -430,6 +588,8 @@ impl App {
                     self.confirm = Some(book.id.clone());
                 }
             }
+            KeyCode::Char('f') => self.url_input = Some(String::new()),
+            KeyCode::Char('u') => self.update_selected(),
             KeyCode::Char('o') => {
                 let Some(book) = self.selected_book().cloned() else {
                     return Ok(());
@@ -541,7 +701,11 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(Color::LightRed),
         )),
         Some((message, false)) => Line::from(Span::styled(
-            format!(" {message}"),
+            if app.pending_task.is_some() {
+                format!(" {} {message}", ["|", "/", "-", "\\"][app.spinner_frame])
+            } else {
+                format!(" {message}")
+            },
             Style::default().fg(Color::Green),
         )),
         None => Line::from(Span::styled(" Ready", Style::default().fg(Color::DarkGray))),
@@ -719,6 +883,12 @@ fn draw_details(frame: &mut Frame, app: &mut App, area: Rect) {
                     Style::default().fg(Color::LightGreen),
                 )));
             }
+            if let Some(url) = book.source_url() {
+                lines.push(Line::from(Span::styled(
+                    format!("Source: {url}"),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
 
             lines.push(Line::from(vec![
                 Span::styled("File: ", Style::default().fg(Color::DarkGray)),
@@ -758,7 +928,17 @@ fn draw_details(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
-    let line = if let Some(draft) = &app.draft {
+    let line = if let Some(url) = &app.url_input {
+        Line::from(vec![
+            Span::styled(" Download URL: ", Style::default().fg(Color::Yellow)),
+            Span::raw(url.clone()),
+            Span::styled("█", Style::default().fg(Color::Yellow)),
+            Span::styled(
+                "  Enter download · Esc cancel",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])
+    } else if let Some(draft) = &app.draft {
         Line::from(vec![
             Span::styled(" Search: ", Style::default().fg(Color::Yellow)),
             Span::raw(draft.clone()),
@@ -781,7 +961,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         };
         Line::from(vec![
             Span::styled(
-                " q quit · j/k · Tab details · / search · s sort · Enter read · o open · d delete · ? help",
+                " q quit · j/k · Tab details · / search · f download · u update · Enter read · o open · d delete · ? help",
                 Style::default().fg(Color::DarkGray),
             ),
             Span::styled(filter, Style::default().fg(Color::Yellow)),
@@ -818,6 +998,8 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         help_line("Enter", "read the selected EPUB inside clibrary"),
         help_line("o", "open the selected EPUB in your system viewer"),
         help_line("d", "remove the book and its files (asks first)"),
+        help_line("f", "download a fic URL with FanFicFare"),
+        help_line("u", "update the selected FanFicFare fic"),
         help_line("r", "reload the index from disk"),
         help_line("q / Ctrl-C", "quit"),
         Line::from(""),
@@ -1055,6 +1237,64 @@ mod tests {
 
         press(&mut app, KeyCode::Char('n'));
         assert!(app.confirm.is_none());
+    }
+
+    #[test]
+    fn fanficfare_shortcuts_report_ineligible_books_and_invalid_urls() {
+        let (_temporary, mut app) = setup();
+        press(&mut app, KeyCode::Char('u'));
+        assert!(
+            app.status
+                .as_ref()
+                .unwrap()
+                .0
+                .contains("no FanFicFare source URL")
+        );
+
+        press(&mut app, KeyCode::Char('f'));
+        for character in "file:///tmp/story".chars() {
+            press(&mut app, KeyCode::Char(character));
+        }
+        assert!(render(&mut app, 110, 32).contains("Download URL:"));
+        press(&mut app, KeyCode::Enter);
+        for _ in 0..100 {
+            app.poll_pending_task();
+            if app.pending_task.is_none() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(app.status.as_ref().unwrap().0.contains("HTTP or HTTPS"));
+    }
+
+    #[test]
+    fn fanficfare_progress_animates_and_reports_worker_errors() {
+        let (_temporary, mut app) = setup();
+        let (sender, receiver) = mpsc::channel();
+        app.pending_task = Some(PendingTask {
+            action: PendingAction::Download,
+            receiver,
+        });
+        app.set_status("Downloading https://archive.example/story", false);
+
+        let first = render(&mut app, 110, 32);
+        app.spinner_frame = 1;
+        let second = render(&mut app, 110, 32);
+        assert_ne!(first, second);
+        assert!(second.contains("Downloading https://archive.example/story"));
+
+        sender
+            .send(Err(anyhow::anyhow!("simulated FanFicFare failure")))
+            .unwrap();
+        app.poll_pending_task();
+        assert!(app.pending_task.is_none());
+        assert!(
+            app.status
+                .as_ref()
+                .unwrap()
+                .0
+                .contains("simulated FanFicFare failure")
+        );
     }
 
     #[test]

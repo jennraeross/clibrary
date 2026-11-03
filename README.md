@@ -43,6 +43,8 @@ lets you browse, search, and sort it from the terminal.
   use two columns with sensible maximum line lengths. Your place is saved when
   you leave the reader, so reopening a book resumes where you stopped.
 - **Scriptable commands** — `list --json`, `show --json`, stable exit codes.
+- **FanFicFare integration** — download fics by URL and update tracked stories
+  when the `fanficfare` command is installed.
 - **Private storage** — the library defaults to
   `$XDG_DATA_HOME/clibrary` (usually `~/.local/share/clibrary`) with private
   directory and file permissions.
@@ -86,6 +88,11 @@ clibrary list --json
 clibrary show dune
 clibrary show 7b80f652d0e5
 clibrary export "dune" --to ~/Desktop
+
+# Download or update fics (requires FanFicFare on PATH)
+clibrary download https://archiveofourown.org/works/123456
+clibrary update
+clibrary update "My Fic"
 ```
 
 The library is stored in `$XDG_DATA_HOME/clibrary` by default. Override it with
@@ -102,6 +109,8 @@ CLIBRARY_DIR=~/Books/clibrary clibrary
 | --- | --- |
 | `clibrary` | Open the interactive browser (same as `clibrary tui`). |
 | `clibrary add <PATH>...` | Import EPUB files, or scan directories recursively. `--move` deletes sources after a verified copy; `--dry-run` previews; `--json` prints results. |
+| `clibrary download <URL>` | Download a fic with FanFicFare and add the resulting EPUB. `--json` prints a machine-readable result. |
+| `clibrary update [QUERY]` | Update the matching FanFicFare-tracked fic, or all tracked fics when no query is given. `--json` prints results. |
 | `clibrary list [QUERY]` | List books, optionally filtered. `--sort recent\|author\|title\|series\|published\|added` (also `date`/`year` for published), `--reverse`, `--json`. Defaults to `recent`. |
 | `clibrary show <QUERY>` | Show full metadata for one book. `--json`. |
 | `clibrary open <QUERY>` | Open the book in the system EPUB viewer. |
@@ -117,6 +126,16 @@ matching IDs so you can pick one.
 Add JSON output includes a `status` of `added`, `duplicate`, `would-add`, or
 `error` for every input.
 
+FanFicFare support uses the external `fanficfare` executable; clibrary does not
+install it. Install and configure FanFicFare separately, then ensure its
+command is on `PATH`. Downloaded EPUBs are staged and validated before import.
+Updates are offered only for books whose EPUB metadata contains a FanFicFare
+story URL. The TUI uses `f` to enter a download URL and `u` to update the
+selected tracked story. Updates keep the saved reading position. The TUI shows
+an animated working indicator during downloads and updates; CLI commands show
+indeterminate progress on stderr when run interactively, without affecting
+JSON output.
+
 ## Browser keys
 
 | Key | Action |
@@ -131,6 +150,8 @@ Add JSON output includes a `status` of `added`, `duplicate`, `would-add`, or
 | `S` | Reverse the sort order (`recent` starts newest-first) |
 | `Enter` | Read the selected EPUB inside `clibrary` |
 | `o` | Open the selected EPUB in the system viewer |
+| `f` | Download a fic from a URL with FanFicFare |
+| `u` | Update the selected FanFicFare-tracked fic |
 | `d` | Delete the book and its files (asks for `y`/`n`) |
 | `r` | Reload the index from disk |
 | `?` | Toggle the help overlay |

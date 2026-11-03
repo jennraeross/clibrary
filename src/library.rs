@@ -21,6 +21,12 @@ pub enum AddOutcome {
 }
 
 #[derive(Debug)]
+pub enum UpdateOutcome {
+    Updated(Book),
+    Unchanged(Book),
+}
+
+#[derive(Debug)]
 pub struct Removal {
     pub book: Book,
     pub files_removed: bool,
@@ -264,6 +270,127 @@ impl Library {
         self.index.books.iter().find(|book| book.hash == hash)
     }
 
+    /// Replace a FanFicFare EPUB while preserving its library location and
+    /// reading progress.
+    pub fn update_epub(&mut self, id: &str, source: &Path) -> Result<UpdateOutcome> {
+        if !util::is_epub_file(source) {
+            bail!("{} is not an EPUB file", source.display());
+        }
+        let source = fs::canonicalize(source)
+            .with_context(|| format!("cannot resolve {}", source.display()))?;
+        if !source.is_file() {
+            bail!("{} is not a regular file", source.display());
+        }
+        if source.starts_with(self.books_dir()) {
+            bail!("refusing to update a book from inside the library");
+        }
+
+        let (hash, size) = util::hash_file(&source)?;
+        let parsed = epub::read_metadata(&source)?;
+        let updated_url = source_url_from_identifiers(&parsed.identifiers)
+            .context("updated EPUB has no FanFicFare source URL")?;
+
+        let _lock = self.lock()?;
+        self.reload()?;
+        let position = self
+            .index
+            .books
+            .iter()
+            .position(|book| book.id == id)
+            .with_context(|| format!("book {id} is not in the library"))?;
+        let existing = self.index.books[position].clone();
+        let existing_url = existing
+            .source_url()
+            .context("this book has no FanFicFare source URL and cannot be updated")?;
+        if existing_url != updated_url {
+            bail!("updated EPUB does not match the book's stored story URL");
+        }
+        if hash == existing.hash {
+            return Ok(UpdateOutcome::Unchanged(existing));
+        }
+        if let Some(duplicate) = self.index.books.iter().find(|book| book.hash == hash) {
+            bail!(
+                "updated EPUB duplicates another book in the library ({})",
+                duplicate.id
+            );
+        }
+        let new_id = &hash[..12];
+        if self
+            .index
+            .books
+            .iter()
+            .any(|book| book.id == new_id && book.id != id)
+        {
+            bail!("updated EPUB would collide with another book ID");
+        }
+
+        let mut updated = existing.clone();
+        updated.id = new_id.to_string();
+        updated.hash = hash.clone();
+        updated.title = parsed
+            .title
+            .as_deref()
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+            .unwrap_or(&existing.title)
+            .to_string();
+        updated.author_sort = parsed.author_sort;
+        updated.authors = parsed.authors;
+        updated.series = parsed.series;
+        updated.series_index = parsed.series_index;
+        updated.publisher = parsed.publisher;
+        updated.published = parsed.published;
+        updated.language = parsed.language;
+        updated.description = parsed.description;
+        updated.subjects = parsed.subjects;
+        updated.identifiers = parsed.identifiers;
+        updated.size = size;
+
+        let destination = self.book_path(&existing);
+        let directory = destination
+            .parent()
+            .context("library book path has no parent directory")?;
+        let staging = tempfile::Builder::new()
+            .prefix(".clibrary-update-")
+            .tempdir_in(directory)
+            .context("cannot create a private update staging directory")?;
+        let temporary = staging.path().join("copy.tmp");
+        let candidate = staging.path().join("candidate.epub");
+        let backup = staging.path().join("original.epub");
+        util::copy_verified(&source, &temporary, &candidate, &hash)?;
+
+        fs::rename(&destination, &backup)
+            .with_context(|| format!("cannot stage existing EPUB {}", destination.display()))?;
+        if let Err(error) = fs::rename(&candidate, &destination) {
+            let _ = fs::remove_file(&candidate);
+            if let Err(restore_error) = fs::rename(&backup, &destination) {
+                return Err(anyhow::anyhow!(
+                    "cannot replace existing EPUB {}: {error}; could not restore original EPUB: {restore_error}",
+                    destination.display()
+                ));
+            }
+            return Err(error).with_context(|| {
+                format!("cannot replace existing EPUB {}", destination.display())
+            });
+        }
+        util::sync_dir(directory);
+
+        self.index.books[position] = updated.clone();
+        if let Err(error) = self.save() {
+            self.index.books[position] = existing.clone();
+            fs::remove_file(&destination).with_context(|| {
+                format!("could not remove failed update {}", destination.display())
+            })?;
+            fs::rename(&backup, &destination).with_context(|| {
+                format!("could not restore original EPUB {}", destination.display())
+            })?;
+            return Err(error.context("could not update the library index"));
+        }
+        util::remove_file_if_exists(&backup);
+        util::sync_dir(directory);
+        Ok(UpdateOutcome::Updated(updated))
+    }
+
     /// Record where the reader left off in a book.
     pub fn set_reading_progress(&mut self, id: &str, mut progress: ReadingProgress) -> Result<()> {
         progress.updated_at = util::now_unix();
@@ -444,6 +571,12 @@ fn ambiguous(query: &str, matches: &[&Book]) -> anyhow::Error {
     anyhow::anyhow!("{message}")
 }
 
+fn source_url_from_identifiers(identifiers: &[crate::model::Identifier]) -> Option<&str> {
+    identifiers
+        .iter()
+        .find_map(crate::model::Identifier::source_url)
+}
+
 fn validate_index(index: &Index) -> Result<()> {
     if index.version > INDEX_VERSION {
         bail!(
@@ -474,6 +607,7 @@ fn validate_index(index: &Index) -> Result<()> {
 mod tests {
     use super::*;
     use crate::fixtures::{EpubSpec, write_epub};
+    use crate::model::ReadingProgress;
 
     fn setup() -> (tempfile::TempDir, Library) {
         let temporary = tempfile::tempdir().unwrap();
@@ -525,6 +659,93 @@ mod tests {
         let reopened = Library::open(library.root().to_path_buf()).unwrap();
         assert_eq!(reopened.books().len(), 1);
         assert_eq!(reopened.books()[0].title, "The Hobbit");
+    }
+
+    #[test]
+    fn updates_fanficfare_book_and_preserves_reading_progress() {
+        let (temporary, mut library) = setup();
+        let url = "https://archive.example/story/42";
+        let first = EpubSpec {
+            source_url: Some(url.to_string()),
+            ..EpubSpec::new("Old Title", "An Author")
+        };
+        let book = add_book(&mut library, temporary.path(), &first);
+        let progress = ReadingProgress {
+            chapter: 3,
+            chapters: 8,
+            fraction: 0.4,
+            updated_at: 123,
+        };
+        library.set_reading_progress(&book.id, progress).unwrap();
+        let progress = library.resolve(&book.id).unwrap().reading_progress.unwrap();
+        let previous_path = book.epub_path.clone();
+
+        let updated_source = temporary.path().join("updated.epub");
+        write_epub(
+            &updated_source,
+            &EpubSpec {
+                title: Some("New Title".to_string()),
+                source_url: Some(url.to_string()),
+                ..EpubSpec::new("New Title", "A New Author")
+            },
+        )
+        .unwrap();
+
+        let outcome = library.update_epub(&book.id, &updated_source).unwrap();
+        let updated = match outcome {
+            UpdateOutcome::Updated(book) => book,
+            UpdateOutcome::Unchanged(_) => panic!("updated EPUB was reported unchanged"),
+        };
+        assert_ne!(updated.id, book.id);
+        assert_eq!(updated.title, "New Title");
+        assert_eq!(updated.epub_path, previous_path);
+        assert_eq!(updated.reading_progress, Some(progress));
+        assert_eq!(updated.source_url(), Some(url));
+        assert_eq!(library.books().len(), 1);
+        assert!(
+            !library
+                .book_path(&updated)
+                .parent()
+                .unwrap()
+                .join("original.epub")
+                .exists()
+        );
+        assert_eq!(
+            util::hash_file(&library.book_path(&updated)).unwrap().0,
+            updated.hash
+        );
+        assert!(library.resolve(&book.id).is_err());
+    }
+
+    #[test]
+    fn refuses_updates_from_a_different_story_url() {
+        let (temporary, mut library) = setup();
+        let original = add_book(
+            &mut library,
+            temporary.path(),
+            &EpubSpec {
+                source_url: Some("https://archive.example/story/1".to_string()),
+                ..EpubSpec::new("Story", "An Author")
+            },
+        );
+        let replacement = temporary.path().join("replacement.epub");
+        write_epub(
+            &replacement,
+            &EpubSpec {
+                source_url: Some("https://archive.example/story/2".to_string()),
+                ..EpubSpec::new("Other Story", "An Author")
+            },
+        )
+        .unwrap();
+        assert!(
+            library
+                .update_epub(&original.id, &replacement)
+                .unwrap_err()
+                .to_string()
+                .contains("does not match")
+        );
+        assert_eq!(library.books()[0].id, original.id);
+        assert!(library.book_path(&original).is_file());
     }
 
     #[test]

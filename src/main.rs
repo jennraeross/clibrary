@@ -2,15 +2,17 @@ use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::thread;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 use walkdir::WalkDir;
 
-use clibrary::library::{AddOutcome, Library};
+use clibrary::library::{AddOutcome, Library, UpdateOutcome};
 use clibrary::model::{Book, SortKey, sorted_indices};
-use clibrary::{epub, tui, util};
+use clibrary::{epub, fanficfare, tui, util};
 
 #[derive(Parser)]
 #[command(
@@ -52,6 +54,22 @@ enum Command {
         /// Show what would be imported without changing anything
         #[arg(long)]
         dry_run: bool,
+        /// Print machine-readable results
+        #[arg(long)]
+        json: bool,
+    },
+    /// Download a fic URL with FanFicFare and add its EPUB to the library
+    Download {
+        /// HTTP or HTTPS story URL
+        url: String,
+        /// Print a machine-readable result
+        #[arg(long)]
+        json: bool,
+    },
+    /// Update one or all FanFicFare stories already in the library
+    Update {
+        /// Book ID, ID prefix, or search term; omit to update all eligible books
+        query: Option<String>,
         /// Print machine-readable results
         #[arg(long)]
         json: bool,
@@ -141,6 +159,8 @@ fn run() -> Result<ExitCode> {
             dry_run,
             json,
         } => add(&root, &paths, move_files, dry_run, json),
+        Command::Download { url, json } => download(&root, &url, json),
+        Command::Update { query, json } => update(&root, query.as_deref(), json),
         Command::List {
             query,
             sort,
@@ -157,6 +177,248 @@ fn run() -> Result<ExitCode> {
         Command::Export { query, to } => export(&root, &query, &to),
         Command::Where => where_is(&root),
         Command::Verify => verify(&root),
+    }
+}
+
+#[derive(Serialize)]
+struct FanficReport {
+    source: String,
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+impl FanficReport {
+    fn error(source: impl Into<String>, error: impl std::fmt::Display) -> Self {
+        Self {
+            source: source.into(),
+            status: "error",
+            id: None,
+            title: None,
+            path: None,
+            error: Some(error.to_string()),
+        }
+    }
+
+    fn book(source: impl Into<String>, book: &Book, status: &'static str) -> Self {
+        Self {
+            source: source.into(),
+            status,
+            id: Some(book.id.clone()),
+            title: Some(book.title.clone()),
+            path: Some(book.epub_path.clone()),
+            error: None,
+        }
+    }
+}
+
+fn download(root: &Path, url: &str, json: bool) -> Result<ExitCode> {
+    let mut library = Library::open(root)?;
+    let report = match with_progress(
+        &format!("Downloading {url}"),
+        !json && io::stderr().is_terminal(),
+        || fanficfare::download(url),
+    ) {
+        Ok(staged) => match library.add_epub(staged.path()) {
+            Ok(AddOutcome::Added(book)) => FanficReport::book(url, &book, "downloaded"),
+            Ok(AddOutcome::Duplicate(book)) => FanficReport::book(url, &book, "duplicate"),
+            Err(error) => FanficReport::error(url, format!("{error:#}")),
+        },
+        Err(error) => FanficReport::error(url, format!("{error:#}")),
+    };
+    print_fanfic_reports(std::slice::from_ref(&report), json)?;
+    Ok(if report.status == "error" {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
+fn update(root: &Path, query: Option<&str>, json: bool) -> Result<ExitCode> {
+    let mut library = Library::open(root)?;
+    let books = if let Some(query) = query {
+        vec![library.resolve(query)?.clone()]
+    } else {
+        library
+            .books()
+            .iter()
+            .filter(|book| book.source_url().is_some())
+            .cloned()
+            .collect()
+    };
+    if books.is_empty() {
+        let report = FanficReport::error(
+            "",
+            "no FanFicFare stories with a source URL are in the library",
+        );
+        print_fanfic_reports(std::slice::from_ref(&report), json)?;
+        return Ok(ExitCode::FAILURE);
+    }
+
+    let mut reports = Vec::with_capacity(books.len());
+    for book in books {
+        let Some(url) = book.source_url().map(str::to_string) else {
+            reports.push(FanficReport::error(
+                book.id,
+                "this book has no FanFicFare source URL and cannot be updated",
+            ));
+            continue;
+        };
+        let path = library.book_path(&book);
+        let report = match with_progress(
+            &format!("Updating {}", book.title),
+            !json && io::stderr().is_terminal(),
+            || fanficfare::update(&book, &path),
+        ) {
+            Ok(staged) => match library.update_epub(&book.id, staged.path()) {
+                Ok(UpdateOutcome::Updated(updated)) => FanficReport::book(url, &updated, "updated"),
+                Ok(UpdateOutcome::Unchanged(updated)) => {
+                    FanficReport::book(url, &updated, "unchanged")
+                }
+                Err(error) => FanficReport::error(url, format!("{error:#}")),
+            },
+            Err(error) => FanficReport::error(url, format!("{error:#}")),
+        };
+        reports.push(report);
+    }
+
+    let failed = reports.iter().any(|report| report.status == "error");
+    print_fanfic_reports(&reports, json)?;
+    Ok(if failed {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
+fn with_progress<T, F>(message: &str, enabled: bool, operation: F) -> Result<T>
+where
+    T: Send,
+    F: FnOnce() -> Result<T> + Send,
+{
+    with_progress_writer(message, enabled, &mut io::stderr().lock(), operation)
+}
+
+fn with_progress_writer<T, F, W>(
+    message: &str,
+    enabled: bool,
+    writer: &mut W,
+    operation: F,
+) -> Result<T>
+where
+    T: Send,
+    F: FnOnce() -> Result<T> + Send,
+    W: Write,
+{
+    if !enabled {
+        return operation();
+    }
+
+    thread::scope(|scope| {
+        let handle = scope.spawn(operation);
+        let frames = ["|", "/", "-", "\\"];
+        let mut frame = 0;
+        let mut display_error = None;
+        while !handle.is_finished() {
+            if display_error.is_none()
+                && let Err(error) =
+                    write!(writer, "\r{} {message}", frames[frame]).and_then(|()| writer.flush())
+            {
+                display_error = Some(error);
+            }
+            frame = (frame + 1) % frames.len();
+            thread::sleep(Duration::from_millis(120));
+        }
+
+        if display_error.is_none()
+            && let Err(error) = writer.write_all(b"\r\x1b[2K").and_then(|()| writer.flush())
+        {
+            display_error = Some(error);
+        }
+
+        let result = handle
+            .join()
+            .map_err(|_| anyhow::anyhow!("the FanFicFare operation panicked"))?;
+        if let Some(error) = display_error {
+            return Err(error).context("cannot display progress on stderr");
+        }
+        result
+    })
+}
+
+fn print_fanfic_reports(reports: &[FanficReport], json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(reports)?);
+        return Ok(());
+    }
+    for report in reports {
+        match report.status {
+            "downloaded" | "updated" | "unchanged" | "duplicate" => println!(
+                "{:<10} {}{}",
+                report.status,
+                report.title.as_deref().unwrap_or("?"),
+                report
+                    .id
+                    .as_deref()
+                    .map(|id| format!("  ({id})"))
+                    .unwrap_or_default()
+            ),
+            _ => println!(
+                "error      {}: {}",
+                report.source,
+                report.error.as_deref().unwrap_or("unknown error")
+            ),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn progress_is_indeterminate_and_cleared_after_completion() {
+        let mut output = Vec::new();
+        let value = with_progress_writer("Downloading story", true, &mut output, || {
+            thread::sleep(Duration::from_millis(270));
+            Ok::<_, anyhow::Error>(42)
+        })
+        .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(value, 42);
+        assert!(output.contains("Downloading story"));
+        assert!(output.ends_with("\r\x1b[2K"));
+        assert!(!output.contains('%'));
+    }
+
+    #[test]
+    fn progress_is_suppressed_when_disabled() {
+        let mut output = Vec::new();
+        let value = with_progress_writer("Updating story", false, &mut output, || {
+            Ok::<_, anyhow::Error>(42)
+        })
+        .unwrap();
+        assert_eq!(value, 42);
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn progress_is_cleared_when_the_operation_fails() {
+        let mut output = Vec::new();
+        let error = with_progress_writer("Updating story", true, &mut output, || {
+            thread::sleep(Duration::from_millis(270));
+            Err::<(), _>(anyhow::anyhow!("simulated update failure"))
+        })
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("simulated update failure"));
+        assert!(String::from_utf8(output).unwrap().ends_with("\r\x1b[2K"));
     }
 }
 
@@ -491,6 +753,9 @@ fn show(root: &Path, query: &str, json: bool) -> Result<ExitCode> {
     }
     if let Some(published) = &book.published {
         println!("Published:   {published}");
+    }
+    if let Some(url) = book.source_url() {
+        println!("Source URL:  {url}");
     }
     if let Some(publisher) = &book.publisher {
         println!("Publisher:   {publisher}");

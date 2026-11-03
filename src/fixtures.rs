@@ -38,6 +38,7 @@ pub struct EpubSpec {
     pub language: Option<String>,
     pub description: Option<String>,
     pub identifier: Option<String>,
+    pub source_url: Option<String>,
     pub subjects: Vec<String>,
     pub series: Option<String>,
     pub series_index: Option<f32>,
@@ -58,6 +59,7 @@ impl Default for EpubSpec {
             language: Some("en".to_string()),
             description: Some("<p>A <b>test</b> book &amp; sample.</p>".to_string()),
             identifier: Some("urn:isbn:9780000000000".to_string()),
+            source_url: None,
             subjects: vec!["Fiction".to_string()],
             series: None,
             series_index: None,
@@ -105,6 +107,19 @@ pub fn write_epub(path: &Path, spec: &EpubSpec) -> Result<()> {
             "<dc:identifier id=\"bookid\">{}</dc:identifier>",
             xml_escape(identifier)
         ));
+    }
+    if let Some(url) = &spec.source_url {
+        if spec.epub3 {
+            metadata.push_str(&format!(
+                "<dc:identifier>URL:{}</dc:identifier>",
+                xml_escape(url)
+            ));
+        } else {
+            metadata.push_str(&format!(
+                "<dc:identifier opf:scheme=\"URL\">{}</dc:identifier>",
+                xml_escape(url)
+            ));
+        }
     }
     if let Some(title) = &spec.title {
         metadata.push_str(&format!("<dc:title>{}</dc:title>", xml_escape(title)));

@@ -136,6 +136,23 @@ pub struct Identifier {
     pub value: String,
 }
 
+impl Identifier {
+    pub fn source_url(&self) -> Option<&str> {
+        let value = self
+            .value
+            .strip_prefix("URL:")
+            .or_else(|| self.value.strip_prefix("url:"))
+            .unwrap_or(&self.value);
+        let has_url_scheme = self
+            .scheme
+            .as_deref()
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("url"));
+        (has_url_scheme || value != self.value)
+            .then_some(value)
+            .filter(|value| value.starts_with("https://") || value.starts_with("http://"))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Book {
     /// First 12 hex characters of the SHA-256 of the EPUB contents.
@@ -179,6 +196,11 @@ pub struct Book {
 }
 
 impl Book {
+    /// FanFicFare's source URL, when this EPUB records one.
+    pub fn source_url(&self) -> Option<&str> {
+        self.identifiers.iter().find_map(Identifier::source_url)
+    }
+
     pub fn authors_display(&self) -> String {
         if self.authors.is_empty() {
             "Unknown author".to_string()

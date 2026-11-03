@@ -1054,18 +1054,10 @@ fn extract_xhtml(bytes: &[u8]) -> Vec<Block> {
 }
 
 fn walk_blocks(node: Node<'_, '_>, blocks: &mut Vec<Block>, depth: usize, quote: bool) {
+    let mut inline = Vec::new();
     for child in node.children() {
         if child.is_text() {
-            let mut spans = Vec::new();
-            collect_inline(child, InlineStyle::Normal, &mut spans);
-            let spans = normalize_spans(spans);
-            if !spans.is_empty() {
-                blocks.push(if quote {
-                    Block::Quote(spans)
-                } else {
-                    Block::Paragraph(spans)
-                });
-            }
+            collect_inline(child, InlineStyle::Normal, &mut inline);
             continue;
         }
         if !child.is_element() {
@@ -1075,8 +1067,12 @@ fn walk_blocks(node: Node<'_, '_>, blocks: &mut Vec<Block>, depth: usize, quote:
         match tag.as_str() {
             "script" | "style" | "head" | "title" | "nav" | "svg" | "img" | "audio" | "video"
             | "object" | "iframe" => {}
-            "p" => push_text_block(child, blocks, quote, None),
+            "p" => {
+                push_inline_block(&mut inline, blocks, quote);
+                push_text_block(child, blocks, quote, None);
+            }
             "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
+                push_inline_block(&mut inline, blocks, quote);
                 let level = tag[1..].parse::<u8>().unwrap_or(1);
                 let mut spans = Vec::new();
                 collect_inline(child, InlineStyle::Bold, &mut spans);
@@ -1085,16 +1081,25 @@ fn walk_blocks(node: Node<'_, '_>, blocks: &mut Vec<Block>, depth: usize, quote:
                     blocks.push(Block::Heading { level, spans });
                 }
             }
-            "blockquote" => walk_blocks(child, blocks, depth, true),
+            "blockquote" => {
+                push_inline_block(&mut inline, blocks, quote);
+                walk_blocks(child, blocks, depth, true);
+            }
             "pre" => {
+                push_inline_block(&mut inline, blocks, quote);
                 let text = raw_text(child);
                 let text = text.trim_matches('\n').trim_end().to_string();
                 if !text.trim().is_empty() {
                     blocks.push(Block::Preformatted(text));
                 }
             }
-            "hr" => blocks.push(Block::Rule),
+            "hr" => {
+                push_inline_block(&mut inline, blocks, quote);
+                blocks.push(Block::Rule);
+            }
+            "br" => push_inline_block(&mut inline, blocks, quote),
             "ul" | "ol" => {
+                push_inline_block(&mut inline, blocks, quote);
                 let mut number = child
                     .attribute("start")
                     .and_then(|value| value.trim().parse::<usize>().ok())
@@ -1134,6 +1139,7 @@ fn walk_blocks(node: Node<'_, '_>, blocks: &mut Vec<Block>, depth: usize, quote:
                 }
             }
             "li" => {
+                push_inline_block(&mut inline, blocks, quote);
                 let mut spans = Vec::new();
                 for content in child.children() {
                     if content.is_element() && matches!(content.tag_name().name(), "ul" | "ol") {
@@ -1158,14 +1164,71 @@ fn walk_blocks(node: Node<'_, '_>, blocks: &mut Vec<Block>, depth: usize, quote:
             "div" | "section" | "article" | "main" | "header" | "footer" | "aside" | "figure"
             | "figcaption" | "body" | "html" | "table" | "thead" | "tbody" | "tfoot" | "tr"
             | "td" | "th" | "dl" | "dt" | "dd" | "details" | "summary" => {
+                push_inline_block(&mut inline, blocks, quote);
                 walk_blocks(child, blocks, depth, quote);
             }
+            _ if is_inline_tag(&tag) => {
+                collect_inline(child, InlineStyle::Normal, &mut inline);
+            }
             _ => {
-                // Stray inline content at block level still becomes readable text.
+                push_inline_block(&mut inline, blocks, quote);
                 push_text_block(child, blocks, quote, None);
             }
         }
     }
+    push_inline_block(&mut inline, blocks, quote);
+}
+
+fn push_inline_block(inline: &mut Vec<InlineSpan>, blocks: &mut Vec<Block>, quote: bool) {
+    let spans = normalize_spans(std::mem::take(inline));
+    if spans.is_empty() {
+        return;
+    }
+    blocks.push(if quote {
+        Block::Quote(spans)
+    } else {
+        Block::Paragraph(spans)
+    });
+}
+
+fn is_inline_tag(tag: &str) -> bool {
+    matches!(
+        tag,
+        "a" | "abbr"
+            | "acronym"
+            | "b"
+            | "bdi"
+            | "bdo"
+            | "big"
+            | "cite"
+            | "code"
+            | "del"
+            | "dfn"
+            | "em"
+            | "font"
+            | "i"
+            | "ins"
+            | "kbd"
+            | "label"
+            | "mark"
+            | "q"
+            | "ruby"
+            | "rp"
+            | "rt"
+            | "s"
+            | "samp"
+            | "small"
+            | "span"
+            | "strike"
+            | "strong"
+            | "sub"
+            | "sup"
+            | "time"
+            | "tt"
+            | "u"
+            | "var"
+            | "wbr"
+    )
 }
 
 fn push_text_block(
@@ -1620,6 +1683,59 @@ mod tests {
         );
         assert!(matches!(&blocks[5], Block::Preformatted(text) if text.contains("indented")));
         assert!(matches!(blocks[6], Block::Rule));
+    }
+
+    #[test]
+    fn keeps_emphasized_inline_content_in_its_paragraph() {
+        let html = br#"<html xmlns="http://www.w3.org/1999/xhtml"><body>
+  <div>Before <em>italic</em> between <strong>bold</strong> after.</div>
+</body></html>"#;
+        let blocks = extract_xhtml(html);
+        assert_eq!(blocks.len(), 1);
+        let Block::Paragraph(spans) = &blocks[0] else {
+            panic!("expected one paragraph, got {blocks:?}");
+        };
+        assert_eq!(plain_spans(spans), "Before italic between bold after.");
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.text.contains("italic") && span.style == InlineStyle::Italic)
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.text.contains("bold") && span.style == InlineStyle::Bold)
+        );
+    }
+
+    #[test]
+    fn preserves_paragraph_breaks_marked_with_br() {
+        let html = br#"<html xmlns="http://www.w3.org/1999/xhtml"><body>
+  <div>First paragraph<br/>Second paragraph</div>
+</body></html>"#;
+        let blocks = extract_xhtml(html);
+        assert_eq!(blocks.len(), 2);
+        for (block, expected) in blocks.iter().zip(["First paragraph", "Second paragraph"]) {
+            let Block::Paragraph(spans) = block else {
+                panic!("expected paragraph, got {block:?}");
+            };
+            assert_eq!(plain_spans(spans), expected);
+        }
+    }
+
+    #[test]
+    fn preserves_separate_blocks_with_unrecognized_tags() {
+        let html = br#"<html xmlns="http://www.w3.org/1999/xhtml"><body>
+  <section><first>First paragraph</first><second>Second paragraph</second></section>
+</body></html>"#;
+        let blocks = extract_xhtml(html);
+        assert_eq!(blocks.len(), 2);
+        for (block, expected) in blocks.iter().zip(["First paragraph", "Second paragraph"]) {
+            let Block::Paragraph(spans) = block else {
+                panic!("expected paragraph, got {block:?}");
+            };
+            assert_eq!(plain_spans(spans), expected);
+        }
     }
 
     #[test]
