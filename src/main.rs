@@ -12,7 +12,7 @@ use walkdir::WalkDir;
 
 use clibrary::library::{AddOutcome, Library, UpdateOutcome};
 use clibrary::model::{Book, SortKey, sorted_indices};
-use clibrary::{epub, fanficfare, tui, util};
+use clibrary::{consent, epub, fanficfare, tui, util};
 
 #[derive(Parser)]
 #[command(
@@ -62,6 +62,9 @@ enum Command {
     Download {
         /// HTTP or HTTPS story URL
         url: String,
+        /// Assume adult consent for FanFicFare (AO3 "are you 18?" check) and remember it
+        #[arg(long)]
+        adult: bool,
         /// Print a machine-readable result
         #[arg(long)]
         json: bool,
@@ -70,6 +73,9 @@ enum Command {
     Update {
         /// Book ID, ID prefix, or search term; omit to update all eligible books
         query: Option<String>,
+        /// Assume adult consent for FanFicFare (AO3 "are you 18?" check) and remember it
+        #[arg(long)]
+        adult: bool,
         /// Print machine-readable results
         #[arg(long)]
         json: bool,
@@ -159,8 +165,8 @@ fn run() -> Result<ExitCode> {
             dry_run,
             json,
         } => add(&root, &paths, move_files, dry_run, json),
-        Command::Download { url, json } => download(&root, &url, json),
-        Command::Update { query, json } => update(&root, query.as_deref(), json),
+        Command::Download { url, adult, json } => download(&root, &url, adult, json),
+        Command::Update { query, adult, json } => update(&root, query.as_deref(), adult, json),
         Command::List {
             query,
             sort,
@@ -218,13 +224,61 @@ impl FanficReport {
     }
 }
 
-fn download(root: &Path, url: &str, json: bool) -> Result<ExitCode> {
+fn adult_guidance_error() -> anyhow::Error {
+    anyhow::anyhow!(
+        "FanFicFare requires adult consent for this work (AO3 \"are you 18?\" check). Re-run with --adult or run interactively once to confirm and remember"
+    )
+}
+
+fn remember_adult_consent() {
+    if let Err(error) = consent::set_adult_consented() {
+        eprintln!("warning: could not remember adult consent: {error:#}");
+    }
+}
+
+fn prompt_adult_consent() -> Result<bool> {
+    if !io::stdin().is_terminal() {
+        return Ok(false);
+    }
+    eprint!(
+        "This work may contain adult content. Confirm you are an adult and remember this choice for future downloads? [y/N] "
+    );
+    io::stderr().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
+fn download(root: &Path, url: &str, adult: bool, json: bool) -> Result<ExitCode> {
     let mut library = Library::open(root)?;
-    let report = match with_progress(
-        &format!("Downloading {url}"),
-        !json && io::stderr().is_terminal(),
-        || fanficfare::download(url),
-    ) {
+    let progress = !json && io::stderr().is_terminal();
+    let mut consented = adult || consent::is_adult_consented();
+    if adult && !consent::is_adult_consented() {
+        remember_adult_consent();
+        consented = true;
+    }
+    let interactive = !json && io::stdin().is_terminal();
+    let mut staged = with_progress(&format!("Downloading {url}"), progress, || {
+        fanficfare::download(url, consented)
+    });
+    if let Err(ref error) = staged
+        && fanficfare::is_adult_check_error(error)
+        && !consented
+    {
+        if interactive && prompt_adult_consent()? {
+            remember_adult_consent();
+            consented = true;
+            staged = with_progress(&format!("Downloading {url}"), progress, || {
+                fanficfare::download(url, true)
+            });
+        } else {
+            staged = Err(adult_guidance_error());
+        }
+    }
+    let report = match staged {
         Ok(staged) => match library.add_epub(staged.path()) {
             Ok(AddOutcome::Added(book)) => FanficReport::book(url, &book, "downloaded"),
             Ok(AddOutcome::Duplicate(book)) => FanficReport::book(url, &book, "duplicate"),
@@ -232,6 +286,7 @@ fn download(root: &Path, url: &str, json: bool) -> Result<ExitCode> {
         },
         Err(error) => FanficReport::error(url, format!("{error:#}")),
     };
+    let _ = consented;
     print_fanfic_reports(std::slice::from_ref(&report), json)?;
     Ok(if report.status == "error" {
         ExitCode::FAILURE
@@ -240,7 +295,7 @@ fn download(root: &Path, url: &str, json: bool) -> Result<ExitCode> {
     })
 }
 
-fn update(root: &Path, query: Option<&str>, json: bool) -> Result<ExitCode> {
+fn update(root: &Path, query: Option<&str>, adult: bool, json: bool) -> Result<ExitCode> {
     let mut library = Library::open(root)?;
     let books = if let Some(query) = query {
         vec![library.resolve(query)?.clone()]
@@ -261,6 +316,14 @@ fn update(root: &Path, query: Option<&str>, json: bool) -> Result<ExitCode> {
         return Ok(ExitCode::FAILURE);
     }
 
+    let mut consented = adult || consent::is_adult_consented();
+    if adult && !consent::is_adult_consented() {
+        remember_adult_consent();
+        consented = true;
+    }
+    let interactive = !json && io::stdin().is_terminal();
+    let progress = !json && io::stderr().is_terminal();
+    let mut prompted = false;
     let mut reports = Vec::with_capacity(books.len());
     for book in books {
         let Some(url) = book.source_url().map(str::to_string) else {
@@ -271,11 +334,29 @@ fn update(root: &Path, query: Option<&str>, json: bool) -> Result<ExitCode> {
             continue;
         };
         let path = library.book_path(&book);
-        let report = match with_progress(
-            &format!("Updating {}", book.title),
-            !json && io::stderr().is_terminal(),
-            || fanficfare::update(&book, &path),
-        ) {
+        let mut staged = with_progress(&format!("Updating {}", book.title), progress, || {
+            fanficfare::update(&book, &path, consented)
+        });
+        if let Err(ref error) = staged
+            && fanficfare::is_adult_check_error(error)
+            && !consented
+        {
+            if interactive && !prompted {
+                prompted = true;
+                if prompt_adult_consent()? {
+                    remember_adult_consent();
+                    consented = true;
+                    staged = with_progress(&format!("Updating {}", book.title), progress, || {
+                        fanficfare::update(&book, &path, true)
+                    });
+                } else {
+                    staged = Err(adult_guidance_error());
+                }
+            } else {
+                staged = Err(adult_guidance_error());
+            }
+        }
+        let report = match staged {
             Ok(staged) => match library.update_epub(&book.id, staged.path()) {
                 Ok(UpdateOutcome::Updated(updated)) => FanficReport::book(url, &updated, "updated"),
                 Ok(UpdateOutcome::Unchanged(updated)) => {

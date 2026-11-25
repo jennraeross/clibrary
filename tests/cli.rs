@@ -15,18 +15,25 @@ use tempfile::TempDir;
 struct TestEnv {
     temporary: TempDir,
     library: PathBuf,
+    consent: PathBuf,
 }
 
 impl TestEnv {
     fn new() -> Self {
         let temporary = tempfile::tempdir().unwrap();
         let library = temporary.path().join("library");
-        Self { temporary, library }
+        let consent = temporary.path().join("adult_consent");
+        Self {
+            temporary,
+            library,
+            consent,
+        }
     }
 
     fn command(&self) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_clibrary"));
         command.arg("--library").arg(&self.library);
+        command.env("CLIBRARY_ADULT_CONSENT_FILE", &self.consent);
         command
     }
 
@@ -513,6 +520,94 @@ fn downloads_and_updates_fics_through_fanficfare() {
     assert_eq!(books[0].title, "Tracked Fic Updated");
     assert_eq!(books[0].source_url(), Some(url));
     assert_eq!(books[0].reading_progress.unwrap().chapter, 2);
+}
+
+#[cfg(unix)]
+#[test]
+fn adult_consent_is_requested_once_and_remembered() {
+    use std::os::unix::fs::PermissionsExt;
+
+    fn quote(path: &Path) -> String {
+        format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+    }
+
+    let env = TestEnv::new();
+    let url = "https://archive.example/story/25";
+    let gated_epub = env.temporary.path().join("gated.epub");
+    write_epub(
+        &gated_epub,
+        &EpubSpec {
+            source_url: Some(url.to_string()),
+            ..EpubSpec::new("Gated Fic", "An Author")
+        },
+    )
+    .unwrap();
+
+    // Without `-o is_adult=true` the fake FanFicFare prints FanFicFare's
+    // non-interactive adult-check message and produces no EPUB.
+    let fake_bin = env.temporary.path().join("bin");
+    fs::create_dir(&fake_bin).unwrap();
+    let executable = fake_bin.join("fanficfare");
+    fs::write(
+        &executable,
+        format!(
+            "#!/bin/sh\nif [ \"$2\" = \"-o\" ] && [ \"$3\" = \"is_adult=true\" ]; then\n  /bin/cp -- {} \"$PWD/story.epub\"\nelse\n  echo 'Adult check required on non-interactive process. Set is_adult:true in personal.ini or pass -o \"is_adult=true\" to the command.'\nfi\n",
+            quote(&gated_epub)
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    let path = format!(
+        "{}:{}",
+        fake_bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    // No TTY in tests and --json never prompts: expect guidance instead.
+    let blocked = env.run_with_path(&["download", url, "--json"], &path);
+    assert!(!blocked.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&blocked.stdout).unwrap();
+    assert_eq!(report[0]["status"], "error");
+    assert!(report[0]["error"].as_str().unwrap().contains("--adult"));
+    assert!(!env.consent.exists());
+
+    // --adult passes the flag and remembers consent globally.
+    let consented = env.run_with_path(&["download", "--adult", url, "--json"], &path);
+    assert_success(&consented);
+    let report: serde_json::Value = serde_json::from_slice(&consented.stdout).unwrap();
+    assert_eq!(report[0]["status"], "downloaded");
+    assert_eq!(fs::read_to_string(&env.consent).unwrap(), "true\n");
+    // Consent file is private.
+    let mode = fs::metadata(&env.consent).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+
+    // A later download without --adult reuses the remembered consent.
+    // Note: same content would dedupe by hash, so use a distinct fixture.
+    let other_epub = env.temporary.path().join("other.epub");
+    write_epub(
+        &other_epub,
+        &EpubSpec {
+            source_url: Some("https://archive.example/story/26".to_string()),
+            ..EpubSpec::new("Other Gated Fic", "An Author")
+        },
+    )
+    .unwrap();
+    fs::write(
+        &executable,
+        format!(
+            "#!/bin/sh\nif [ \"$2\" = \"-o\" ] && [ \"$3\" = \"is_adult=true\" ]; then\n  if [ \"$6\" = \"https://archive.example/story/26\" ]; then\n    /bin/cp -- {} \"$PWD/story.epub\"\n  else\n    /bin/cp -- {} \"$PWD/story.epub\"\n  fi\nelse\n  echo 'Adult check required on non-interactive process. Set is_adult:true in personal.ini or pass -o \"is_adult=true\" to the command.'\nfi\n",
+            quote(&other_epub),
+            quote(&gated_epub)
+        ),
+    )
+    .unwrap();
+    let remembered = env.run_with_path(
+        &["download", "https://archive.example/story/26", "--json"],
+        &path,
+    );
+    assert_success(&remembered);
+    let report: serde_json::Value = serde_json::from_slice(&remembered.stdout).unwrap();
+    assert_eq!(report[0]["status"], "downloaded");
 }
 
 #[cfg(unix)]

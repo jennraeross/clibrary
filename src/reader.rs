@@ -754,7 +754,9 @@ fn reader_regions(area: Rect) -> (Rect, Rect, Rect) {
     };
     let top = area.y + if area.height >= 5 { 2 } else { 1 };
     let bottom = if area.height >= 2 {
-        footer.y
+        footer
+            .y
+            .saturating_sub(if area.height >= 5 { 1 } else { 0 })
     } else {
         area.y + area.height
     };

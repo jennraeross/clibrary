@@ -10,6 +10,7 @@ use walkdir::WalkDir;
 use crate::epub;
 use crate::model::Book;
 
+#[derive(Debug)]
 pub struct StagedEpub {
     _directory: TempDir,
     path: PathBuf,
@@ -21,19 +22,27 @@ impl StagedEpub {
     }
 }
 
-pub fn download(url: &str) -> Result<StagedEpub> {
-    download_with(OsStr::new("fanficfare"), url)
+pub fn download(url: &str, is_adult: bool) -> Result<StagedEpub> {
+    download_with(OsStr::new("fanficfare"), url, is_adult)
 }
 
-fn download_with(program: &OsStr, url: &str) -> Result<StagedEpub> {
+fn download_with(program: &OsStr, url: &str, is_adult: bool) -> Result<StagedEpub> {
     validate_url(url)?;
     let directory = tempfile::tempdir().context("cannot create a private download directory")?;
-    run_fanficfare(
-        program,
-        &["--non-interactive", "--format", "epub", url],
-        directory.path(),
-    )?;
-    let path = find_epub(directory.path())?;
+    let mut arguments: Vec<&str> = vec!["--non-interactive"];
+    if is_adult {
+        arguments.extend(["-o", "is_adult=true"]);
+    }
+    arguments.extend(["--format", "epub", url]);
+    let output = run_fanficfare(program, &arguments, directory.path())?;
+    check_adult_output(&output)?;
+    let path = find_epub(directory.path()).map_err(|error| {
+        if is_adult_check_output(&output) {
+            anyhow::anyhow!("{ADULT_CHECK_MESSAGE}")
+        } else {
+            error
+        }
+    })?;
     validate_epub(&path)?;
     let metadata = epub::read_metadata(&path)?;
     if !metadata
@@ -49,11 +58,16 @@ fn download_with(program: &OsStr, url: &str) -> Result<StagedEpub> {
     })
 }
 
-pub fn update(book: &Book, epub_path: &Path) -> Result<StagedEpub> {
-    update_with(OsStr::new("fanficfare"), book, epub_path)
+pub fn update(book: &Book, epub_path: &Path, is_adult: bool) -> Result<StagedEpub> {
+    update_with(OsStr::new("fanficfare"), book, epub_path, is_adult)
 }
 
-fn update_with(program: &OsStr, book: &Book, epub_path: &Path) -> Result<StagedEpub> {
+fn update_with(
+    program: &OsStr,
+    book: &Book,
+    epub_path: &Path,
+    is_adult: bool,
+) -> Result<StagedEpub> {
     let url = book
         .source_url()
         .context("this book has no FanFicFare source URL and cannot be updated")?;
@@ -61,17 +75,16 @@ fn update_with(program: &OsStr, book: &Book, epub_path: &Path) -> Result<StagedE
     let staged_path = directory.path().join("update.epub");
     fs::copy(epub_path, &staged_path)
         .with_context(|| format!("cannot stage {}", epub_path.display()))?;
-    run_fanficfare(
-        program,
-        &[
-            "--non-interactive",
-            "--update-epub",
-            staged_path
-                .to_str()
-                .context("staged path is not valid UTF-8")?,
-        ],
-        directory.path(),
-    )?;
+    let staged_str = staged_path
+        .to_str()
+        .context("staged path is not valid UTF-8")?;
+    let mut arguments: Vec<&str> = vec!["--non-interactive"];
+    if is_adult {
+        arguments.extend(["-o", "is_adult=true"]);
+    }
+    arguments.extend(["--update-epub", staged_str]);
+    let output = run_fanficfare(program, &arguments, directory.path())?;
+    check_adult_output(&output)?;
     validate_epub(&staged_path)?;
     let updated = epub::read_metadata(&staged_path)?;
     let updated_url = updated
@@ -95,7 +108,51 @@ fn validate_url(url: &str) -> Result<()> {
     }
 }
 
-fn run_fanficfare(program: &OsStr, arguments: &[&str], directory: &Path) -> Result<()> {
+/// FanFicFare's message when an adult check blocks a `--non-interactive`
+/// download. FanFicFare exits 0 in that case and produces no EPUB, so
+/// clibrary detects this output to offer a consent prompt and retry.
+pub const ADULT_CHECK_MARKER: &str = "Adult check required on non-interactive process";
+
+const ADULT_CHECK_MESSAGE: &str = "FanFicFare: Adult check required on non-interactive process. Set adult consent to download this work";
+
+/// Whether this error came from an adult check (AO3's "are you 18?" gate).
+pub fn is_adult_check_error(error: &anyhow::Error) -> bool {
+    format!("{error:#}")
+        .to_lowercase()
+        .contains("adult check required")
+}
+
+fn is_adult_check_output(output: &FanficfareOutput) -> bool {
+    output
+        .combined()
+        .to_lowercase()
+        .contains("adult check required")
+}
+
+fn check_adult_output(output: &FanficfareOutput) -> Result<()> {
+    if is_adult_check_output(output) {
+        bail!("{ADULT_CHECK_MESSAGE}");
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+pub struct FanficfareOutput {
+    stdout: String,
+    stderr: String,
+}
+
+impl FanficfareOutput {
+    fn combined(&self) -> String {
+        format!("{}\n{}", self.stdout, self.stderr)
+    }
+}
+
+fn run_fanficfare(
+    program: &OsStr,
+    arguments: &[&str],
+    directory: &Path,
+) -> Result<FanficfareOutput> {
     let output = Command::new(program)
         .args(arguments)
         .current_dir(directory)
@@ -106,13 +163,18 @@ fn run_fanficfare(program: &OsStr, arguments: &[&str], directory: &Path) -> Resu
                 program.to_string_lossy()
             )
         })?;
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        if stdout.to_lowercase().contains("adult check required")
+            || stderr.to_lowercase().contains("adult check required")
+        {
+            bail!("{ADULT_CHECK_MESSAGE}");
+        }
         let details = if stderr.trim().is_empty() {
-            stdout.trim()
+            stdout.trim().to_string()
         } else {
-            stderr.trim()
+            stderr.trim().to_string()
         };
         bail!(
             "FanFicFare failed with {}{}",
@@ -124,7 +186,7 @@ fn run_fanficfare(program: &OsStr, arguments: &[&str], directory: &Path) -> Resu
             }
         );
     }
-    Ok(())
+    Ok(FanficfareOutput { stdout, stderr })
 }
 
 fn find_epub(directory: &Path) -> Result<PathBuf> {
@@ -232,7 +294,25 @@ mod tests {
                 quote(&fixture)
             ),
         );
-        let staged = download_with(downloader.as_os_str(), url).unwrap();
+        let staged = download_with(downloader.as_os_str(), url, false).unwrap();
+        assert_eq!(
+            epub::read_metadata(staged.path())
+                .unwrap()
+                .identifiers
+                .iter()
+                .find_map(Identifier::source_url),
+            Some(url)
+        );
+
+        let adult_downloader = temporary.path().join("adult-download");
+        script(
+            &adult_downloader,
+            &format!(
+                "[ \"$1\" = \"--non-interactive\" ] && [ \"$2\" = \"-o\" ] && [ \"$3\" = \"is_adult=true\" ] && [ \"$4\" = \"--format\" ] && [ \"$5\" = \"epub\" ] || exit 13\ncp -- {} story.epub",
+                quote(&fixture)
+            ),
+        );
+        let staged = download_with(adult_downloader.as_os_str(), url, true).unwrap();
         assert_eq!(
             epub::read_metadata(staged.path())
                 .unwrap()
@@ -252,7 +332,8 @@ mod tests {
             &updater,
             "[ \"$1\" = \"--non-interactive\" ] && [ \"$2\" = \"--update-epub\" ] && [ -f \"$3\" ] || exit 12",
         );
-        let updated = update_with(updater.as_os_str(), &book, &library.book_path(&book)).unwrap();
+        let updated =
+            update_with(updater.as_os_str(), &book, &library.book_path(&book), false).unwrap();
         assert_eq!(
             epub::read_metadata(updated.path())
                 .unwrap()
@@ -261,6 +342,49 @@ mod tests {
                 .find_map(Identifier::source_url),
             Some(url)
         );
+
+        let adult_updater = temporary.path().join("adult-update");
+        script(
+            &adult_updater,
+            "[ \"$1\" = \"--non-interactive\" ] && [ \"$2\" = \"-o\" ] && [ \"$3\" = \"is_adult=true\" ] && [ \"$4\" = \"--update-epub\" ] && [ -f \"$5\" ] || exit 14",
+        );
+        let updated = update_with(
+            adult_updater.as_os_str(),
+            &book,
+            &library.book_path(&book),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            epub::read_metadata(updated.path())
+                .unwrap()
+                .identifiers
+                .iter()
+                .find_map(Identifier::source_url),
+            Some(url)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reports_adult_checks_without_an_epub() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let blocker = temporary.path().join("blocker");
+        fs::write(
+            &blocker,
+            "#!/bin/sh\necho 'Adult check required on non-interactive process. Set is_adult:true in personal.ini or pass -o \"is_adult=true\" to the command.'\n",
+        )
+        .unwrap();
+        fs::set_permissions(&blocker, fs::Permissions::from_mode(0o700)).unwrap();
+        let error = download_with(
+            blocker.as_os_str(),
+            "https://archive.example/story/99",
+            false,
+        )
+        .unwrap_err();
+        assert!(is_adult_check_error(&error));
     }
 
     #[test]

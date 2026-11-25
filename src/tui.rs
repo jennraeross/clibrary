@@ -22,13 +22,13 @@ use crate::library::{AddOutcome, Library, UpdateOutcome};
 use crate::model::{Book, ReaderSettings, SortKey, sorted_indices};
 use crate::reader::{Reader, ReaderAction};
 use crate::wrap;
-use crate::{fanficfare, util};
+use crate::{consent, fanficfare, util};
 
 const PAGE_SIZE: usize = 10;
 const DETAILS_PAGE_LINES: usize = 5;
 
 enum PendingAction {
-    Download,
+    Download(String),
     Update(Box<Book>),
 }
 
@@ -121,6 +121,7 @@ struct App {
     spinner_frame: usize,
     status: Option<(String, bool)>,
     confirm: Option<String>,
+    adult_confirm: Option<PendingAction>,
     help: bool,
     quit: bool,
     reader: Option<Reader>,
@@ -146,6 +147,7 @@ impl App {
             spinner_frame: 0,
             status: None,
             confirm: None,
+            adult_confirm: None,
             help: false,
             quit: false,
             reader: None,
@@ -272,22 +274,42 @@ impl App {
         self.details_scroll = self.details_scroll.saturating_add_signed(delta);
     }
 
+    fn spawn_download(&mut self, url: String, is_adult: bool) {
+        let worker_url = url.clone();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = sender.send(fanficfare::download(&worker_url, is_adult));
+        });
+        self.pending_task = Some(PendingTask {
+            action: PendingAction::Download(url),
+            receiver,
+        });
+        self.spinner_frame = 0;
+    }
+
+    fn spawn_update(&mut self, book: Book, is_adult: bool) {
+        self.set_status(format!("Updating {}", book.title), false);
+        let path = self.library.book_path(&book);
+        let worker_book = book.clone();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = sender.send(fanficfare::update(&worker_book, &path, is_adult));
+        });
+        self.pending_task = Some(PendingTask {
+            action: PendingAction::Update(Box::new(book)),
+            receiver,
+        });
+        self.spinner_frame = 0;
+    }
+
     fn download_url(&mut self, url: &str) {
         if self.pending_task.is_some() {
             return;
         }
         let url = url.to_string();
-        let worker_url = url.clone();
-        let (sender, receiver) = mpsc::channel();
-        thread::spawn(move || {
-            let _ = sender.send(fanficfare::download(&worker_url));
-        });
-        self.pending_task = Some(PendingTask {
-            action: PendingAction::Download,
-            receiver,
-        });
-        self.spinner_frame = 0;
+        let is_adult = consent::is_adult_consented();
         self.set_status(format!("Downloading {url}"), false);
+        self.spawn_download(url, is_adult);
     }
 
     fn update_selected(&mut self) {
@@ -301,18 +323,25 @@ impl App {
             self.set_status("Selected book has no FanFicFare source URL", true);
             return;
         }
-        self.set_status(format!("Updating {}", book.title), false);
-        let path = self.library.book_path(&book);
-        let worker_book = book.clone();
-        let (sender, receiver) = mpsc::channel();
-        thread::spawn(move || {
-            let _ = sender.send(fanficfare::update(&worker_book, &path));
-        });
-        self.pending_task = Some(PendingTask {
-            action: PendingAction::Update(Box::new(book)),
-            receiver,
-        });
-        self.spinner_frame = 0;
+        let is_adult = consent::is_adult_consented();
+        self.spawn_update(book, is_adult);
+    }
+
+    fn confirm_adult_consent(&mut self) {
+        let Some(action) = self.adult_confirm.take() else {
+            return;
+        };
+        if let Err(error) = consent::set_adult_consented() {
+            self.set_status(format!("Could not remember adult consent: {error:#}"), true);
+            return;
+        }
+        match action {
+            PendingAction::Download(url) => {
+                self.set_status(format!("Downloading {url}"), false);
+                self.spawn_download(url, true);
+            }
+            PendingAction::Update(book) => self.spawn_update(*book, true),
+        }
     }
 
     fn poll_pending_task(&mut self) {
@@ -335,12 +364,16 @@ impl App {
         let staged = match result {
             Ok(staged) => staged,
             Err(error) => {
+                if fanficfare::is_adult_check_error(&error) && !consent::is_adult_consented() {
+                    self.adult_confirm = Some(task.action);
+                    return;
+                }
                 self.set_status(format!("{error:#}"), true);
                 return;
             }
         };
         match task.action {
-            PendingAction::Download => match self.library.add_epub(staged.path()) {
+            PendingAction::Download(_) => match self.library.add_epub(staged.path()) {
                 Ok(AddOutcome::Added(book)) => {
                     self.set_status(format!("Downloaded \"{}\"", book.title), false);
                     self.refresh_missing();
@@ -434,6 +467,23 @@ impl App {
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                     self.confirm = None;
                     self.set_status("Delete cancelled", false);
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+
+        if self.adult_confirm.is_some() {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    self.confirm_adult_consent();
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.adult_confirm = None;
+                    self.set_status(
+                        "Adult consent declined; re-run with consent to download this work",
+                        true,
+                    );
                 }
                 _ => {}
             }
@@ -675,6 +725,9 @@ fn ui(frame: &mut Frame, app: &mut App) {
     }
     if app.confirm.is_some() {
         draw_confirm(frame, app, area);
+    }
+    if app.adult_confirm.is_some() {
+        draw_adult_confirm(frame, area);
     }
 }
 
@@ -1060,6 +1113,41 @@ fn draw_confirm(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(dialog, popup);
 }
 
+fn draw_adult_confirm(frame: &mut Frame, area: Rect) {
+    let popup = centered_rect(area, 74, 9);
+    frame.render_widget(Clear, popup);
+    let text = Text::from(vec![
+        Line::from(Span::styled(
+            "This work may contain adult content.",
+            Style::default().fg(Color::Yellow),
+        )),
+        Line::from(Span::styled(
+            "Confirm you are an adult and remember this",
+            Style::default(),
+        )),
+        Line::from(Span::styled(
+            "choice for future downloads?",
+            Style::default(),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "y / Enter confirm · n / Esc cancel",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ])
+    .alignment(Alignment::Center);
+    let dialog = Paragraph::new(text)
+        .alignment(Alignment::Center)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Adult content ")
+                .border_style(Style::default().fg(Color::Yellow)),
+        )
+        .wrap(Wrap { trim: true });
+    frame.render_widget(dialog, popup);
+}
+
 fn help_line(key: &str, description: &str) -> Line<'static> {
     Line::from(vec![
         Span::styled(format!("  {key:<15}"), Style::default().fg(Color::Yellow)),
@@ -1268,11 +1356,31 @@ mod tests {
     }
 
     #[test]
+    fn adult_consent_dialog_declines_without_retrying() {
+        let (_temporary, mut app) = setup();
+        app.adult_confirm = Some(PendingAction::Download(
+            "https://archive.example/story/1".to_string(),
+        ));
+        let screen = render(&mut app, 110, 32);
+        assert!(screen.contains("Adult content"));
+        press(&mut app, KeyCode::Char('n'));
+        assert!(app.adult_confirm.is_none());
+        assert!(app.pending_task.is_none());
+        assert!(
+            app.status
+                .as_ref()
+                .unwrap()
+                .0
+                .contains("Adult consent declined")
+        );
+    }
+
+    #[test]
     fn fanficfare_progress_animates_and_reports_worker_errors() {
         let (_temporary, mut app) = setup();
         let (sender, receiver) = mpsc::channel();
         app.pending_task = Some(PendingTask {
-            action: PendingAction::Download,
+            action: PendingAction::Download("https://archive.example/story".to_string()),
             receiver,
         });
         app.set_status("Downloading https://archive.example/story", false);

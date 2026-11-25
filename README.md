@@ -109,8 +109,8 @@ CLIBRARY_DIR=~/Books/clibrary clibrary
 | --- | --- |
 | `clibrary` | Open the interactive browser (same as `clibrary tui`). |
 | `clibrary add <PATH>...` | Import EPUB files, or scan directories recursively. `--move` deletes sources after a verified copy; `--dry-run` previews; `--json` prints results. |
-| `clibrary download <URL>` | Download a fic with FanFicFare and add the resulting EPUB. `--json` prints a machine-readable result. |
-| `clibrary update [QUERY]` | Update the matching FanFicFare-tracked fic, or all tracked fics when no query is given. `--json` prints results. |
+| `clibrary download <URL>` | Download a fic with FanFicFare and add the resulting EPUB. `--adult` assumes adult consent; `--json` prints a machine-readable result. |
+| `clibrary update [QUERY]` | Update the matching FanFicFare-tracked fic, or all tracked fics when no query is given. `--adult` assumes adult consent; `--json` prints results. |
 | `clibrary list [QUERY]` | List books, optionally filtered. `--sort recent\|author\|title\|series\|published\|added` (also `date`/`year` for published), `--reverse`, `--json`. Defaults to `recent`. |
 | `clibrary show <QUERY>` | Show full metadata for one book. `--json`. |
 | `clibrary open <QUERY>` | Open the book in the system EPUB viewer. |
@@ -135,6 +135,14 @@ selected tracked story. Updates keep the saved reading position. The TUI shows
 an animated working indicator during downloads and updates; CLI commands show
 indeterminate progress on stderr when run interactively, without affecting
 JSON output.
+
+AO3's "are you 18?" check is handled with a one-time prompt: the first time a
+download or update is blocked by FanFicFare's adult check, `clibrary` asks for
+confirmation on an interactive terminal and remembers a `y` answer in
+`$XDG_CONFIG_HOME/clibrary/adult_consent` for all future downloads and
+libraries. Scripts and `--json` runs never prompt; they fail with guidance to
+re-run with `--adult` (which also remembers consent) or confirm once
+interactively. Deleting the consent file resets the prompt.
 
 ## Browser keys
 

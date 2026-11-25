@@ -1,3 +1,4 @@
+pub mod consent;
 pub mod epub;
 pub mod fanficfare;
 pub mod library;
