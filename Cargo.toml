@@ -1,10 +1,14 @@
 [package]
 name = "clibrary"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 rust-version = "1.88"
 description = "A navigable, metadata-aware personal library for EPUB files"
 license = "MIT"
+documentation = "https://docs.rs/clibrary"
+homepage = "https://github.com/jennraeross/clibrary"
+repository = "https://github.com/jennraeross/clibrary"
+readme = "README.md"
 
 [dependencies]
 anyhow = "1"
